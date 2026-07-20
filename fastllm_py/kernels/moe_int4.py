@@ -94,6 +94,115 @@ def _gemv_kernel(cp):
     return _GEMV
 
 
+def build_stacked_experts(expert_ws, group_size: int = 128, xp=np) -> dict:
+    """Stack E experts' {gate,up,down} into contiguous INT4 tensors indexable by
+    expert id (for the fused selective kernel). expert_ws: list of dicts of fp16
+    (out,in) weight matrices. Returns per-proj {qweight (E,out,in/2), scales
+    (E,out,in/gs), zeros (E,out,in/gs)} plus dims."""
+    out = {"group": group_size}
+    for proj in ("gate", "up", "down"):
+        qs, ss, zs = [], [], []
+        for w in expert_ws:
+            p = quantize_int4_rowmajor(w[proj], group_size, xp=xp)
+            qs.append(p["qweight"]); ss.append(p["scales"]); zs.append(p["zeros"])
+            out[f"{proj}.shape"] = p["shape"]
+        out[f"{proj}.qweight"] = xp.ascontiguousarray(xp.stack(qs))
+        out[f"{proj}.scales"] = xp.ascontiguousarray(xp.stack(ss))
+        out[f"{proj}.zeros"] = xp.ascontiguousarray(xp.stack(zs))
+    return out
+
+
+_FUSED = None
+
+
+def _fused_kernel(cp):
+    """One block per routed expert: gate·up·swiglu into shared, then down,
+    accumulate routing_weight * result into the output. Device expert indices,
+    so it's selective (only routed experts read) and capturable."""
+    global _FUSED
+    if _FUSED is None:
+        _FUSED = cp.RawKernel(r"""
+        #include <cuda_fp16.h>
+        __device__ __forceinline__ float row_gemv(
+                const unsigned char* qw, const __half* sc, const __half* ze,
+                int row, const float* vec, int in_f, int gs) {
+            int ng = in_f / gs;
+            const unsigned char* wr = qw + (long long)row * (in_f / 2);
+            const __half* s = sc + (long long)row * ng;
+            const __half* z = ze + (long long)row * ng;
+            float acc = 0.0f;
+            for (int gi = 0; gi < ng; gi++) {
+                float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
+                int i0 = gi * gs;
+                for (int t = 0; t < gs; t += 2) {
+                    unsigned char b = wr[(i0 + t) / 2];
+                    acc += ((float)(b & 0xF) - zv) * sv * vec[i0 + t];
+                    acc += ((float)(b >> 4) - zv) * sv * vec[i0 + t + 1];
+                }
+            }
+            return acc;
+        }
+        extern "C" __global__ void fused_moe(
+                const float* __restrict__ x,          // (hidden,)
+                const unsigned char* __restrict__ gqw, const __half* gsc, const __half* gze,
+                const unsigned char* __restrict__ uqw, const __half* usc, const __half* uze,
+                const unsigned char* __restrict__ dqw, const __half* dsc, const __half* dze,
+                const int* __restrict__ eidx,         // (K,) routed expert ids
+                const float* __restrict__ rw,         // (K,) routing weights
+                float* __restrict__ out,              // (hidden,) accumulated
+                int hidden, int inter, int gs) {
+            int k = blockIdx.x;
+            int e = eidx[k];
+            float w = rw[k];
+            int tid = threadIdx.x, nt = blockDim.x;
+            extern __shared__ float sh[];
+            float* xs = sh;              // hidden
+            float* is = sh + hidden;     // inter
+            for (int i = tid; i < hidden; i += nt) xs[i] = x[i];
+            __syncthreads();
+            // per-expert weight bases
+            long long gq = (long long)e * inter * (hidden / 2);
+            long long gsz = (long long)e * inter * (hidden / gs);
+            long long dq = (long long)e * hidden * (inter / 2);
+            long long dsz = (long long)e * hidden * (inter / gs);
+            for (int r = tid; r < inter; r += nt) {
+                float gr = row_gemv(gqw + gq, gsc + gsz, gze + gsz, r, xs, hidden, gs);
+                float ur = row_gemv(uqw + gq, usc + gsz, uze + gsz, r, xs, hidden, gs);
+                is[r] = (gr / (1.0f + __expf(-gr))) * ur;   // silu(gate)*up
+            }
+            __syncthreads();
+            for (int o = tid; o < hidden; o += nt) {
+                float dv = row_gemv(dqw + dq, dsc + dsz, dze + dsz, o, is, inter, gs);
+                atomicAdd(&out[o], w * dv);
+            }
+        }""", "fused_moe")
+    return _FUSED
+
+
+def fused_moe_ffn(x, stacked, eidx, rw, hidden, inter, out=None):
+    """Selective MoE FFN: sum_k rw[k] * down_e(swiglu(gate_e(x), up_e(x))) for
+    e = eidx[k], in one launch. x: (hidden,) fp32; eidx: (K,) int32; rw: (K,)
+    fp32; stacked: build_stacked_experts output on GPU. Returns (hidden,) fp32."""
+    import cupy as cp
+
+    k = _fused_kernel(cp)
+    gs = stacked["group"]
+    K = int(eidx.shape[0])
+    x = cp.ascontiguousarray(x.astype(cp.float32).ravel())
+    y = out if out is not None else cp.zeros((hidden,), dtype=cp.float32)
+    if out is not None:
+        y.fill(0)
+    threads = 256
+    k((K,), (threads,),
+      (x, stacked["gate.qweight"], stacked["gate.scales"], stacked["gate.zeros"],
+       stacked["up.qweight"], stacked["up.scales"], stacked["up.zeros"],
+       stacked["down.qweight"], stacked["down.scales"], stacked["down.zeros"],
+       eidx.astype(cp.int32), rw.astype(cp.float32), y,
+       np.int32(hidden), np.int32(inter), np.int32(gs)),
+      shared_mem=(hidden + inter) * 4)
+    return y
+
+
 def gemv_int4(x, payload, out=None):
     """y = x @ dequant(W).T for a single decode row. x: (in,) fp32 cupy.
     payload: quantize_int4_rowmajor output on GPU. Returns (out,) fp32."""

@@ -1,0 +1,23 @@
+[
+  {"name": "Qwen3-0.6B", "path": "models/Qwen3-0.6B", "dtype": "float32"},
+  {"name": "deepseek-coder-1.3b", "path": "models/deepseek-coder-1.3b-instruct", "dtype": "float32"},
+  {"name": "R1-Distill-Qwen-1.5B", "path": "models/DeepSeek-R1-Distill-Qwen-1.5B", "dtype": "float32"},
+  {"name": "deepseek-llm-7b", "variant": "fp16", "path": "models/deepseek-llm-7b-chat", "dtype": "float16"},
+  {"name": "deepseek-llm-7b", "variant": "fp32-2gpu", "path": "models/deepseek-llm-7b-chat", "dtype": "float32",
+   "device": {"cuda:0": 1, "cuda:1": 1}},
+  {"name": "deepseek-moe-16b", "variant": "fp16-experts", "path": "models/deepseek-moe-16b-chat",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8},
+  {"name": "deepseek-moe-16b", "variant": "int4-experts", "path": "models/deepseek-moe-16b-chat",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8,
+   "gpu_expert_quant": "int4"},
+  {"name": "Qwen1.5-MoE-A2.7B", "variant": "fp16-experts", "path": "models/Qwen1.5-MoE-A2.7B",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8},
+  {"name": "Qwen1.5-MoE-A2.7B", "variant": "int4-experts", "path": "models/Qwen1.5-MoE-A2.7B",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8,
+   "gpu_expert_quant": "int4"},
+  {"name": "DeepSeek-V2-Lite", "variant": "fp16-experts", "path": "models/DeepSeek-V2-Lite",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8},
+  {"name": "DeepSeek-V2-Lite", "variant": "int4-experts", "path": "models/DeepSeek-V2-Lite",
+   "dtype": "float32", "moe_device": {"cuda": 1, "cpu": 3}, "gpu_cache_gb": 8,
+   "gpu_expert_quant": "int4"}
+]

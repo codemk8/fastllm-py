@@ -29,6 +29,17 @@ def xp_for(device: str):
     return np
 
 
+def dev_ctx(device: str):
+    """Context manager making `device` current (no-op for cpu)."""
+    if device.startswith("cuda"):
+        import cupy as cp
+
+        return cp.cuda.Device(int(device.split(":")[1]) if ":" in device else 0)
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
 def to_device(x, device: str):
     import cupy as cp
 
@@ -204,11 +215,14 @@ class Model:
     # ------------------------------------------------------------- forward
     def _rope_cache(self, positions, dim, xp):
         cfg = self.cfg
-        if cfg.rope_scaling and cfg.rope_scaling.get("type") == "yarn":
+        kind = (cfg.rope_scaling or {}).get("type") or (cfg.rope_scaling or {}).get("rope_type")
+        if kind == "yarn":
             from .kernels.ops import build_rope_cache_yarn
 
             return build_rope_cache_yarn(positions, dim, cfg.rope_theta,
                                          cfg.rope_scaling, xp)
+        if kind == "linear":  # position interpolation (deepseek-coder etc.)
+            positions = positions / float(cfg.rope_scaling["factor"])
         return build_rope_cache(positions, dim, cfg.rope_theta, xp)
 
     def _sdpa(self, q, k_all, v_all, scale, xp):
@@ -315,34 +329,37 @@ class Model:
         past = kv_caches[0].seq_len
         xp0 = xp_for(self.embed_device)
         ids = to_device(np.asarray(token_ids), self.embed_device)
-        x = self.embed[ids]
+        with dev_ctx(self.embed_device):
+            x = self.embed[ids]
         cur_dev = self.embed_device
 
         for layer in self.layers:
             if layer.device != cur_dev:
                 x = to_device(x, layer.device)
                 cur_dev = layer.device
-            xp = xp_for(cur_dev)
-            positions = xp.arange(past, past + x.shape[0])
+            with dev_ctx(cur_dev):
+                xp = xp_for(cur_dev)
+                positions = xp.arange(past, past + x.shape[0])
 
-            # cross-layer prefetch: warm the next MoE layer's hot experts
-            # on the copy stream while this layer computes
-            nxt = layer.idx + 1
-            if nxt < len(self.layers) and self.layers[nxt].moe is not None:
-                self.layers[nxt].moe.prefetch_predicted()
+                # cross-layer prefetch: warm the next MoE layer's hot experts
+                # on the copy stream while this layer computes
+                nxt = layer.idx + 1
+                if nxt < len(self.layers) and self.layers[nxt].moe is not None:
+                    self.layers[nxt].moe.prefetch_predicted()
 
-            h = rmsnorm(x, layer.w["input_layernorm.weight"], cfg.norm_eps)
-            x = x + self._attention(layer, h, positions, kv_caches[layer.idx])
-            h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)
-            if layer.is_moe and layer.moe is not None:
-                x = x + layer.moe.forward(h)
-            else:
-                x = x + self._mlp(layer, h)
+                h = rmsnorm(x, layer.w["input_layernorm.weight"], cfg.norm_eps)
+                x = x + self._attention(layer, h, positions, kv_caches[layer.idx])
+                h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)
+                if layer.is_moe and layer.moe is not None:
+                    x = x + layer.moe.forward(h)
+                else:
+                    x = x + self._mlp(layer, h)
 
         if cur_dev != self.head_device:
             x = to_device(x, self.head_device)
-        x = rmsnorm(x, self.final_norm, cfg.norm_eps)
-        logits = x @ self.lm_head.T
+        with dev_ctx(self.head_device):
+            x = rmsnorm(x, self.final_norm, cfg.norm_eps)
+            logits = x @ self.lm_head.T
         return logits, kv_caches
 
     # ------------------------------------------------------------ generate

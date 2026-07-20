@@ -40,9 +40,20 @@ class ModelConfig:
     scoring_func: str = "softmax"  # softmax | sigmoid
     n_group: int = 0
     topk_group: int = 0
+    # --- MLA (DeepSeek V2/V3; 0/None = standard attention) ---
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+    v_head_dim: int = 0
+    rope_scaling: dict | None = None
     # --- misc ---
     hidden_act: str = "silu"
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def is_mla(self) -> bool:
+        return self.kv_lora_rank > 0
 
     @property
     def is_moe(self) -> bool:
@@ -102,6 +113,12 @@ def load_config(model_path: str | Path) -> ModelConfig:
         scoring_func=_get(cfg, "scoring_func", default="softmax"),
         n_group=_get(cfg, "n_group", default=0) or 0,
         topk_group=_get(cfg, "topk_group", default=0) or 0,
+        q_lora_rank=_get(cfg, "q_lora_rank", default=0) or 0,
+        kv_lora_rank=_get(cfg, "kv_lora_rank", default=0) or 0,
+        qk_nope_head_dim=_get(cfg, "qk_nope_head_dim", default=0) or 0,
+        qk_rope_head_dim=_get(cfg, "qk_rope_head_dim", default=0) or 0,
+        v_head_dim=_get(cfg, "v_head_dim", default=0) or 0,
+        rope_scaling=_get(cfg, "rope_scaling", default=None),
         hidden_act=_get(cfg, "hidden_act", default="silu"),
         raw=cfg,
     )

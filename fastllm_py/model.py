@@ -107,6 +107,11 @@ class Model:
             "self_attn.v_proj.weight", "self_attn.v_proj.bias",
             "self_attn.o_proj.weight",
             "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+            # MLA (DeepSeek V2/V3)
+            "self_attn.q_a_proj.weight", "self_attn.q_a_layernorm.weight",
+            "self_attn.q_b_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_a_layernorm.weight", "self_attn.kv_b_proj.weight",
             "post_attention_layernorm.weight",
             "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
         ]
@@ -188,7 +193,74 @@ class Model:
             self._moe_shared["pool"] = layer.moe.pool
 
     # ------------------------------------------------------------- forward
+    def _rope_cache(self, positions, dim, xp):
+        cfg = self.cfg
+        if cfg.rope_scaling and cfg.rope_scaling.get("type") == "yarn":
+            from .kernels.ops import build_rope_cache_yarn
+
+            return build_rope_cache_yarn(positions, dim, cfg.rope_theta,
+                                         cfg.rope_scaling, xp)
+        return build_rope_cache(positions, dim, cfg.rope_theta, xp)
+
+    def _sdpa(self, q, k_all, v_all, scale, xp):
+        """q: (T,H,Dq), k_all: (S,H,Dq), v_all: (S,H,Dv) → (T, H*Dv) fp-x."""
+        T, S = q.shape[0], k_all.shape[0]
+        qf = q.astype(xp.float32).transpose(1, 0, 2)
+        kf = k_all.astype(xp.float32).transpose(1, 2, 0)
+        scores = (qf @ kf) * xp.float32(scale)
+        q_pos = xp.arange(S - T, S)[:, None]
+        mask = xp.arange(S)[None, :] > q_pos
+        scores = xp.where(mask[None], xp.float32(-1e30), scores)
+        probs = softmax(scores, axis=-1)
+        ctx = probs @ v_all.astype(xp.float32).transpose(1, 0, 2)
+        return ctx.transpose(1, 0, 2).reshape(T, -1)
+
+    def _attention_mla(self, layer: DecoderLayer, x, positions, kv: KVCache):
+        """DeepSeek V2/V3 multi-head latent attention (naive uncompressed
+        cache: stores full per-head K/V like fastllm's simple path)."""
+        from .kernels.ops import deinterleave_rope_input, yarn_get_mscale
+
+        cfg = self.cfg
+        xp = xp_for(layer.device)
+        T = x.shape[0]
+        H = cfg.num_heads
+        Dn, Dr, Dv = cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim
+        Dq = Dn + Dr
+
+        if layer.has("self_attn.q_a_proj.weight"):  # V3 / big V2
+            qa = x @ layer.w["self_attn.q_a_proj.weight"].T
+            qa = rmsnorm(qa, layer.w["self_attn.q_a_layernorm.weight"], cfg.norm_eps)
+            q = qa @ layer.w["self_attn.q_b_proj.weight"].T
+        else:  # V2-Lite
+            q = x @ layer.w["self_attn.q_proj.weight"].T
+        q = q.reshape(T, H, Dq)
+        q_nope, q_pe = q[..., :Dn], q[..., Dn:]
+
+        ckv = x @ layer.w["self_attn.kv_a_proj_with_mqa.weight"].T  # (T, R+Dr)
+        R = cfg.kv_lora_rank
+        c_kv, k_pe = ckv[:, :R], ckv[:, R:].reshape(T, 1, Dr)
+        c_kv = rmsnorm(c_kv, layer.w["self_attn.kv_a_layernorm.weight"], cfg.norm_eps)
+        kv_out = (c_kv @ layer.w["self_attn.kv_b_proj.weight"].T).reshape(T, H, Dn + Dv)
+        k_nope, v = kv_out[..., :Dn], kv_out[..., Dn:]
+
+        cos, sin = self._rope_cache(positions, Dr, xp)
+        q_pe = apply_rope(deinterleave_rope_input(q_pe), cos, sin)
+        k_pe = apply_rope(deinterleave_rope_input(k_pe), cos, sin)
+
+        k = xp.concatenate([k_nope, xp.broadcast_to(k_pe, (T, H, Dr))], axis=-1)
+        k_all, v_all = kv.append(xp.ascontiguousarray(k), xp.ascontiguousarray(v), xp)
+
+        scale = Dq ** -0.5
+        if cfg.rope_scaling and cfg.rope_scaling.get("mscale_all_dim"):
+            m = yarn_get_mscale(float(cfg.rope_scaling["factor"]),
+                                float(cfg.rope_scaling["mscale_all_dim"]))
+            scale *= m * m
+        ctx = self._sdpa(q, k_all, v_all, scale, xp).astype(x.dtype)
+        return ctx @ layer.w["self_attn.o_proj.weight"].T
+
     def _attention(self, layer: DecoderLayer, x, positions, kv: KVCache):
+        if layer.has("self_attn.kv_a_proj_with_mqa.weight"):
+            return self._attention_mla(layer, x, positions, kv)
         cfg = self.cfg
         xp = xp_for(layer.device)
         T = x.shape[0]
@@ -208,26 +280,15 @@ class Model:
             q = rmsnorm(q, layer.w["self_attn.q_norm.weight"], cfg.norm_eps)
             k = rmsnorm(k, layer.w["self_attn.k_norm.weight"], cfg.norm_eps)
 
-        cos, sin = build_rope_cache(positions, D, cfg.rope_theta, xp)
+        cos, sin = self._rope_cache(positions, D, xp)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
         k_all, v_all = kv.append(k, v, xp)
-        S = k_all.shape[0]
         rep = H // KVH
         kx = xp.repeat(k_all, rep, axis=1)  # (S, H, D)
         vx = xp.repeat(v_all, rep, axis=1)
-
-        qf = q.astype(xp.float32).transpose(1, 0, 2)      # (H, T, D)
-        kf = kx.astype(xp.float32).transpose(1, 2, 0)     # (H, D, S)
-        scores = (qf @ kf) * (1.0 / np.sqrt(D))           # (H, T, S)
-        # causal mask: query t attends to keys <= (S - T + t)
-        q_pos = xp.arange(S - T, S)[:, None]
-        mask = xp.arange(S)[None, :] > q_pos
-        scores = xp.where(mask[None], xp.float32(-1e30), scores)
-        probs = softmax(scores, axis=-1)
-        ctx = probs @ vx.astype(xp.float32).transpose(1, 0, 2)  # (H, T, D)
-        ctx = ctx.transpose(1, 0, 2).reshape(T, H * D).astype(x.dtype)
+        ctx = self._sdpa(q, kx, vx, D ** -0.5, xp).astype(x.dtype)
         return lin("self_attn.o_proj", ctx)
 
     def _mlp(self, layer: DecoderLayer, x):

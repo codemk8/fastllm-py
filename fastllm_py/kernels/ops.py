@@ -28,6 +28,50 @@ def build_rope_cache(positions, head_dim: int, theta: float, xp=np):
     return xp.cos(ang), xp.sin(ang)
 
 
+def yarn_get_mscale(scale: float, mscale: float) -> float:
+    if scale <= 1.0:
+        return 1.0
+    return 0.1 * mscale * np.log(scale) + 1.0
+
+
+def build_rope_cache_yarn(positions, head_dim: int, theta: float,
+                          scaling: dict, xp=np):
+    """DeepSeek-V2 YaRN rotary cache. Returns cos/sin (T, head_dim//2)
+    with the YaRN attention-magnitude factor folded in."""
+    factor = float(scaling["factor"])
+    beta_fast = float(scaling.get("beta_fast", 32))
+    beta_slow = float(scaling.get("beta_slow", 1))
+    orig_max = float(scaling.get("original_max_position_embeddings", 4096))
+    mscale = float(scaling.get("mscale", 1.0))
+    mscale_all = float(scaling.get("mscale_all_dim", 0.0))
+
+    def correction_dim(num_rot):
+        return (head_dim * np.log(orig_max / (num_rot * 2 * np.pi))
+                / (2 * np.log(theta)))
+
+    low = max(int(np.floor(correction_dim(beta_fast))), 0)
+    high = min(int(np.ceil(correction_dim(beta_slow))), head_dim - 1)
+    ramp = (xp.arange(head_dim // 2, dtype=xp.float32) - low) / max(high - low, 1e-3)
+    ramp = xp.clip(ramp, 0.0, 1.0)
+    extra_mask = 1.0 - ramp  # 1 → extrapolate (high freq), 0 → interpolate
+
+    exp = xp.arange(0, head_dim, 2, dtype=xp.float32) / head_dim
+    freq_extra = 1.0 / (theta ** exp)
+    freq_inter = 1.0 / (factor * theta ** exp)
+    inv_freq = freq_inter * (1 - extra_mask) + freq_extra * extra_mask
+
+    ang = positions.astype(xp.float32)[:, None] * inv_freq[None, :]
+    m = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all)
+    return xp.cos(ang) * m, xp.sin(ang) * m
+
+
+def deinterleave_rope_input(q):
+    """DeepSeek stores rope dims interleaved [a0,b0,a1,b1,..] — convert to
+    the half-split layout [a0,a1,..,b0,b1,..] expected by rotate_half."""
+    xp = get_xp(q)
+    return xp.concatenate([q[..., 0::2], q[..., 1::2]], axis=-1)
+
+
 def apply_rope(q, cos, sin):
     """q: (T, heads, head_dim), HF 'rotate_half' convention:
     pairs are (x[i], x[i + dim/2])."""

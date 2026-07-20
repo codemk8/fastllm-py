@@ -32,21 +32,22 @@ one launch removes the Python/driver dispatch overhead that dominates decode —
 
 | Model (INT4) | GPUs | eager | graph | speedup |
 |---|---|---|---|---|
-| Qwen3-0.6B | 1 | 43 | **211** | 4.9× |
+| Qwen3-0.6B | 1 | 44 | **228** | 5.2× |
 | deepseek-coder-1.3b | 1 | 60 | **277** | 4.6× |
 | Qwen3-8B | 1 | 33 | **89** | 2.7× |
-| deepseek-llm-67b | 2 | 14.3 | **19.0** | 1.33× |
+| deepseek-llm-67b | 2 | 15.4 | **20.7** | 1.34× |
 
 Speedup shrinks with width (bigger GEMMs are less dispatch-bound) but is a win
-everywhere. Full detail + the `max_len` sizing note: `benchmarks/GRAPH_RESULTS.md`.
+everywhere. Attention is a flash-decode RawKernel (O(valid_len), not O(buffer)),
+so graph decode is robust at any context length. Detail: `benchmarks/GRAPH_RESULTS.md`.
 
 ## Speculative decoding
 
 Greedy speculative decoding (`fastllm_py/speculative.py`) — a small draft
 proposes γ tokens, the target verifies in one forward. Output is **identical to
 greedy target decoding**. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU:
-**1.53×** (γ=4, 68% draft acceptance; target forwards 96 → 30). Composes with
-graph decode.
+**2.03×** (γ=4, 68% draft acceptance; target forwards 96 → 30). The draft
+rollout runs on the graph decoder, so this composes with graph decode.
 
 ## Serving
 

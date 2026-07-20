@@ -9,11 +9,11 @@ copy.
 
 | Model | Arch | GPUs | eager tok/s | graph tok/s | speedup |
 |---|---|---|---|---|---|
-| Qwen3-0.6B | 28L h1024 | 1 | 43 | **211** | 4.9× |
+| Qwen3-0.6B | 28L h1024 | 1 | 44 | **228** | 5.2× |
 | deepseek-coder-1.3b | 24L h2048 | 1 | 60 | **277** | 4.6× |
 | R1-Distill-Qwen-1.5B | 28L h1536 | 1 | 49 | **205** | 4.2× |
 | Qwen3-8B | 36L h4096 | 1 | 33 | **89** | 2.7× |
-| deepseek-llm-67b | 95L h8192 | 2 | 14.3 | **19.0** | 1.33× |
+| deepseek-llm-67b | 95L h8192 | 2 | 15.4 | **20.7** | 1.34× |
 
 The speedup shrinks with model size: decode is dispatch-bound, and larger GEMMs
 (bigger hidden dim) spend proportionally more time in the kernels and less in
@@ -21,14 +21,15 @@ Python/driver launch overhead — so collapsing the launches helps less. Still a
 win everywhere, and the absolute numbers are strong (89 tok/s for 8B INT4 on
 one 4090; 19 tok/s for 67B INT4 on two).
 
-**`max_len` matters a lot for wide models.** Attention here is a bias-masked
-reduction over the whole KV buffer, so its per-token cost is O(max_len), not
-O(sequence). At the old fixed `max_len=2048` the 67B graph was actually 0.51×
-(slower than eager) — the wasted attention scan dominated its 8192-wide layers.
-`GraphDecoder` now sizes buffers to `prompt + max_new_tokens`, bucketed to the
-next power of two, and re-captures on growth; that took the 67B from 0.51× to
-1.33×. (Small models were unaffected — attention is a tiny fraction of their
-work.)
+**Attention is a flash-decode RawKernel, O(valid_len).** Attention loops only
+over the valid `[0, pos]` keys (`valid_len = pos+1`, read from the device pos
+buffer), one block per head with online softmax — so its cost is independent of
+the KV buffer size. An earlier version used a cupy reduction over the *whole*
+`max_len` buffer (O(max_len)); at `max_len=2048` that made the 8192-wide 67B
+graph 0.51× (slower than eager). The kernel removed that entirely: the 67B is
+1.34× at `max_len=4096` just as at `max_len=128`. `GraphDecoder` still buckets
+`max_len` to `prompt+max_new` (and re-captures on growth) purely to save
+memory — it no longer affects speed.
 
 Scope: dense non-MLA, any GPU count (Marlin-quantized linears). MLA decode and
 *offloaded* MoE still fall back to eager. For MoE that fits in VRAM at INT4, the

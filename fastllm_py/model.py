@@ -106,6 +106,13 @@ class KVCache:
     def seq_len(self):
         return self._len
 
+    def truncate(self, n: int):
+        """Drop cached entries so only the first n positions remain (keeps the
+        buffer; just moves the length). Used by speculative decoding to roll
+        back rejected draft tokens."""
+        if n < self._len:
+            self._len = n
+
     # kept for callers/tests that read the raw tensors
     @property
     def k(self):

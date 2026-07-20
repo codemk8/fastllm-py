@@ -23,6 +23,19 @@ concurrently.
 | Speed-estimator calibration (CPU/GPU crossover threshold) | ✅ |
 | FlashInfer paged attention, speculative decoding | ⏳ planned |
 
+## Measured performance
+
+Dev box (1× RTX 4090 used, 93 GB RAM, NFS storage), Qwen1.5-MoE-A2.7B
+single-stream decode, 8 GB GPU expert cache:
+
+| Config | decode tok/s | expert cache hit |
+|---|---|---|
+| fp16 experts, hybrid CPU/GPU | 6.9 | 44% |
+| INT4 (Marlin) GPU experts | **14.6** | 80% |
+
+Dense Qwen3-0.6B fp32: 30 tok/s (python-loop bound; CUDA graphs/paged
+attention are the next lever).
+
 ## Layout
 
 ```

@@ -36,7 +36,10 @@ def calibrate_model(model, batch_sizes=(1, 2, 4, 8, 16, 32, 64, 128),
         stream.synchronize()
 
     def cpu_once(b):
-        _expert_ffn(x_full[:b], w_cpu, np)
+        w = w_cpu
+        if next(iter(w.values())).dtype == np.float16:
+            w = {k: v.astype(np.float32) for k, v in w.items()}  # match runtime path
+        _expert_ffn(x_full[:b], w, np)
 
     gpu_once(1)  # warmup / JIT
     cpu_once(1)

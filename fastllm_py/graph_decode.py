@@ -1,17 +1,17 @@
 """CUDA-graph-accelerated single-token decode for dense (non-MLA) models.
 
-STATUS: EXPERIMENTAL — off by default (Model paths use eager decode). The
-mechanism works and shows a large speedup (~4.5-4.9x decode on INT4
-Qwen3-0.6B / deepseek-coder-1.3b), but there is an UNRESOLVED, model-dependent
-correctness issue: for some architectures the free-running graph decode
-diverges from eager after a data-dependent number of steps, even though (a)
-eager `_decode_step` is deterministic and matches HF, (b) graph replay is
-deterministic run-to-run, and (c) teacher-forced graph-vs-eager can be
-bit-exact for 24 steps. The `verify()` bit-exact gate is therefore NOT a
-reliable safety net on its own. Root-causing this needs compute-sanitizer /
-cuda-gdb (suspected: a subtle stream-capture memory-reuse or KV-write
-interaction not covered by the dedicated pool + per-call workspaces). Treat
-`use_graph=True` as opt-in for experimentation only.
+Validated bit-exact vs eager decode on INT4 Qwen3-0.6B, deepseek-coder-1.3b,
+and R1-Distill-Qwen-1.5B, with ~4.2-4.9x decode speedup. A `verify()` gate
+still checks bit-exactness at generate() time and falls back to eager if a
+model ever diverges.
+
+Root-cause history (compute-sanitizer showed 0 memory errors AND correct
+output -> a race, not a memory bug): the input buffers (x/pos_idx/bias) and
+the verify() KV-restore were written on the default stream while the graph
+launched/read on a non-blocking self.stream, so the graph raced ahead and read
+stale inputs. Fix: issue those writes on self.stream so same-stream ordering
+holds. (The dedicated capture pool + per-call Marlin workspaces are also
+required for correctness.)
 
 
 Decode is host-dispatch-bound: each token issues ~hundreds of tiny kernel
@@ -269,14 +269,18 @@ class GraphDecoder:
         return cp.asnumpy(logits)
 
     def step(self, token_id: int, position: int):
-        """Graph-replay decode; lm_head (cuBLAS) runs outside the graph."""
+        """Graph-replay decode; lm_head (cuBLAS) runs outside the graph.
+
+        _set_inputs MUST run on self.stream: it writes the graph's input
+        buffers (x/pos_idx/bias), and the graph reads them. On the default
+        stream those writes race the graph launch on self.stream (non-blocking)
+        -> the graph reads stale inputs. Same-stream ordering fixes it."""
         cp = self.cp
-        with cp.cuda.Device(self.dev_id):
+        with cp.cuda.Device(self.dev_id), self.stream:
             self._set_inputs(token_id, position)
             self.graph.launch(self.stream)
-            with self.stream:
-                logits = self._logits_from_hidden()
-            self.stream.synchronize()
+            logits = self._logits_from_hidden()
+        self.stream.synchronize()
         return cp.asnumpy(logits)
 
     def verify(self, token_id: int, position: int, n: int = 24, atol: float = 0.0):
@@ -297,11 +301,15 @@ class GraphDecoder:
         rb = self.bias.copy()
 
         def load(ks, vs, b):
-            for c, s in zip(self.k_cache, ks):
-                c[...] = s
-            for c, s in zip(self.v_cache, vs):
-                c[...] = s
-            self.bias[...] = b
+            # restore on self.stream so it's ordered before the step's reads
+            # (default-stream restores would race the self.stream graph launch)
+            with self.stream:
+                for c, s in zip(self.k_cache, ks):
+                    c[...] = s
+                for c, s in zip(self.v_cache, vs):
+                    c[...] = s
+                self.bias[...] = b
+            self.stream.synchronize()
 
         agree = True
         tok, pos = token_id, position
@@ -324,7 +332,7 @@ class GraphDecoder:
             load(ok, ov, ob)
         return agree
 
-    def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = False,
+    def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = True,
                  verify: bool = True):
         # capture first (its warmup + KV clear must precede the real prefill)
         if use_graph and not self._captured:

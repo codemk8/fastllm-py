@@ -66,13 +66,22 @@ only the offload/671B case): read only the routed top-k experts' INT4 weights
 (minimal bandwidth) with routing on-device, in one/few launches instead of 288
 — removing the dispatch and making the MoE FFN CUDA-graph-capturable (like the
 dense path). Design constraint: our experts are quantized in the *Marlin* tiled
-layout, which is very hard to gather/dequant in a custom kernel. Plan: add a
-simple **row-major INT4 group** expert format + a custom fused GEMV kernel that
-takes per-token expert indices (from route_gpu) and dequants inline. Increments:
-(1) profile [done]; (2) custom single-expert INT4 GEMV kernel matching the
-marlin numeric path; (3) fuse gate·up·down + swiglu per expert; (4) selective
-gather over the routed k with on-device routing; (5) graph-capture the whole MoE
-decode. Multi-week; the real gap vs ktransformers.
+layout, which is very hard to gather/dequant in a custom kernel. Plan: a **row-major INT4 group** expert format (`fastllm_py/kernels/moe_int4.py`)
+a custom kernel can gather + dequant inline. **Status (2026-07-20):**
+- (1) profile — done.
+- (2) `gemv_int4` custom row-major INT4 GEMV — done, matches dequant ref.
+- (3) `fused_moe_ffn` one-block-per-expert selective FFN — correct but 8× slower
+  (only K blocks → GPU idle).
+- (4) `fused_moe_ffn2` two-kernel, one block per (expert, output-row), coalesced
+  + block-reduce — **5.4× faster than the eager marlin per-expert loop** on the
+  routed FFN (48.5 vs 264 µs), one launch pair, reads only routed weights.
+- (5) wired into real decode — **Qwen1.5-MoE-A2.7B 18.8 → 33.7 tok/s (1.8×)**,
+  tokens match the marlin path. (Decode-only; T>1 prefill falls back to eager.)
+
+**Remaining:** graph-capture the fused MoE decode (route_gpu + fused_moe_ffn2
+are both capturable) for another lift like the dense path; batched (B>1) fused
+kernel; and the *offload* case (experts don't fit) still needs prefetch/overlap
+on top. This is a working first cut of the real ktransformers-style lever.
 
 ## 3. FlashInfer paged attention + continuous batching
 

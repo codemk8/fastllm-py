@@ -49,6 +49,25 @@ greedy target decoding**. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU:
 **2.03×** (γ=4, 68% draft acceptance; target forwards 96 → 30). The draft
 rollout runs on the graph decoder, so this composes with graph decode.
 
+## Batched decode (throughput / many concurrent streams)
+
+Decode is bottlenecked on reading the weights from VRAM once per token, so
+running B sequences together (each with its own KV) amortizes that read across
+all B — aggregate throughput scales with batch. `fastllm_py/batched.py`
+(`BatchedDecoder`): batched marlin GEMVs, a batched flash-decode attention
+kernel (per-sequence length), and CUDA-graph capture of the whole batched step.
+
+Qwen3-0.6B INT4, aggregate tok/s (CUDA-graph, single GPU):
+
+| Batch | aggregate tok/s | vs 1-stream eager |
+|---|---|---|
+| 1 | 227 | 3.3× |
+| 8 | 1056 | 15× |
+| 16 | **1399** | **21×** |
+
+Each of the 16 streams still runs ~87 tok/s. Correct: every sequence's output
+is identical to its single-stream generation. Dense non-MLA INT4, single GPU.
+
 ## Serving
 
 OpenAI-compatible server auto-enables graph decode for INT4 dense models; each

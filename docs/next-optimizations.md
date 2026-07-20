@@ -46,20 +46,33 @@ for MoE that **fits in VRAM at INT4** (Qwen1.5-MoE experts = 5.8 GB, V2-Lite,
 moe-16b all fit), the win is simply residency — no kernel work needed. Use the
 resident config.
 
-**Dead-end tried + reverted:** dense-over-experts CUDA-graph MoE (compute all E
-experts in a graph, weight-mask to top-k via the capturable `route_gpu`
-helper). Measured **0.84×** — with resident experts, eager top-4 isn't
-dispatch-bound, and computing all 60 experts (15× the GEMVs) costs more than
-the dispatch it removes. `route_gpu` (on-GPU group-limited routing) is kept as
-the routing half of a future fused kernel; the rest was reverted.
+**Profile of resident-MoE decode (Qwen1.5-MoE-A2.7B, 53 ms/tok = 18.8 tok/s;
+scripts/profile_moe.py):**
+- gate + routing + **D2H sync: 3.1 ms (6%)** — NOT the bottleneck.
+- **GPU expert dispatch + GEMV: 31 ms (58%)** — 24L × 4 experts × 3 GEMVs = 288
+  GEMV calls/token, **~107 µs each** vs ~4 µs of actual memory-bound work ⇒
+  ~96% Python/launch **dispatch**, same disease as dense decode.
+- non-MoE (attention/norm/lm_head): 19 ms (36%) — also eager-dispatch-bound.
 
-**Only remaining lever, and only for experts that DON'T fit** (the 671B target):
-a **fused selective gather-GEMV kernel** — gathers just the routed top-k
-experts' INT4 weights on-device (data-dependent indices) and runs their FFNs in
-one launch, with routing on-device. This is what vLLM/sglang/ktransformers
-wrote; it's the real (multi-week) kernel work and the only path to competitive
-*offloaded* MoE decode. A graph can't substitute for it (per-token expert
-uploads aren't capturable).
+**Dead-end (reverted), now with the reason:** dense-over-experts CUDA-graph MoE
+(compute all E experts, weight-mask to top-k) measured **0.84×**. Decode is
+weight-BANDWIDTH-bound, and computing all 60 experts reads **15× more weight
+bytes** than the routed 4 — so it can never beat selective, regardless of
+dispatch. `route_gpu` (on-GPU group-limited routing) is kept as the routing
+half of the real kernel.
+
+**The lever — a fused SELECTIVE MoE kernel** (helps resident decode too, not
+only the offload/671B case): read only the routed top-k experts' INT4 weights
+(minimal bandwidth) with routing on-device, in one/few launches instead of 288
+— removing the dispatch and making the MoE FFN CUDA-graph-capturable (like the
+dense path). Design constraint: our experts are quantized in the *Marlin* tiled
+layout, which is very hard to gather/dequant in a custom kernel. Plan: add a
+simple **row-major INT4 group** expert format + a custom fused GEMV kernel that
+takes per-token expert indices (from route_gpu) and dequants inline. Increments:
+(1) profile [done]; (2) custom single-expert INT4 GEMV kernel matching the
+marlin numeric path; (3) fuse gate·up·down + swiglu per expert; (4) selective
+gather over the routed k with on-device routing; (5) graph-capture the whole MoE
+decode. Multi-week; the real gap vs ktransformers.
 
 ## 3. FlashInfer paged attention + continuous batching
 

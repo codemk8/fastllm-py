@@ -145,6 +145,10 @@ class MoELayer:
 
         def one(t: ExpertTask):
             w = self._materialize_cpu(t.expert_id)
+            if next(iter(w.values())).dtype == np.float16:
+                # numpy skips BLAS on mixed fp32@fp16 (falls back to a scalar
+                # loop, ~10x slower than the cast+sgemm path)
+                w = {k: v.astype(np.float32) for k, v in w.items()}
             y = _expert_ffn(x_cpu[t.token_idx], w, np) * t.weights[:, None]
             return t.token_idx, y
 

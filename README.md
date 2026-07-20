@@ -13,12 +13,13 @@ concurrently.
 | Config-driven model graph (zero per-model code) | ✅ Qwen3, Qwen2-MoE, DeepSeek-V2 families |
 | Dense forward == HuggingFace (fp32, exact argmax) | ✅ Qwen3-0.6B validated |
 | Hybrid CPU/GPU MoE (task-count split, concurrent exec) | ✅ Qwen1.5-MoE-A2.7B validated vs HF |
-| MLA attention + YaRN RoPE (DeepSeek V2/V3) | ✅ code complete, validating on V2-Lite |
+| MLA attention + YaRN RoPE (DeepSeek V2/V3) | ✅ DeepSeek-V2-Lite validated vs official-semantics HF (exact argmax + identical greedy) |
 | GPU expert LRU cache (copy-stream uploads, event-ordered) | ✅ |
 | Cross-layer expert prefetch (frequency-based) | ✅ |
 | Marlin INT4 GEMM + FP8 block-128 GEMV (fastllm CUDA kernels via ctypes) | ✅ .so built, 18 tests |
 | FP8-E4M3 block-128 + INT4 group quantizers (numpy/cupy) | ✅ bit-exact vs torch fp8 |
-| OpenAI-compatible server (`/v1/chat/completions`, streaming) | ✅ |
+| OpenAI-compatible server (`/v1/chat/completions`, streaming) | ✅ smoke-tested (SSE + JSON, 37 tok/s on Qwen3-0.6B) |
+| Marlin INT4 GPU experts (4× cache capacity) | ✅ opt-in `gpu_expert_quant="int4"` |
 | Speed-estimator calibration (CPU/GPU crossover threshold) | ✅ |
 | FlashInfer paged attention, speculative decoding | ⏳ planned |
 
@@ -72,3 +73,8 @@ bash native/build.sh          # optional: native INT4/FP8 kernels (needs nvcc)
 
 Reference: `docs/fastllm-internals.md` documents the C++ internals this port
 replicates (expert split heuristics, kernel formats, stream orchestration).
+
+Note: for DeepSeek models we follow the **official** softmax-scale semantics
+(`scale *= yarn mscale²`, as in modeling_deepseek.py / vLLM / fastllm).
+transformers ≥ 5 native `deepseek_v2` omits this correction, so references
+must be generated with `scripts/make_reference_dsv2.py` (which patches it in).

@@ -68,6 +68,12 @@ Qwen3-0.6B INT4, aggregate tok/s (CUDA-graph, single GPU):
 Each of the 16 streams still runs ~87 tok/s. Correct: every sequence's output
 is identical to its single-stream generation. Dense non-MLA INT4, single GPU.
 
+**Continuous batching** (`BatchedEngine` / `ContinuousEngine`): a fixed pool of
+slots; sequences join and leave dynamically (finished slot → next queued
+request is prefilled in) without re-capturing the graph. Served via the OpenAI
+endpoint with `--continuous --max-batch N` (greedy). Sustained ~700 tok/s
+through 16 slots under continuous load (includes per-request prefill).
+
 ## Serving
 
 OpenAI-compatible server auto-enables graph decode for INT4 dense models; each

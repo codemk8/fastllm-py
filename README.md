@@ -84,11 +84,19 @@ Qwen3-0.6B INT4 served at ~190 tok/s.
 
 For MoE that fits in VRAM at INT4 (Qwen1.5-MoE experts 5.8 GB, V2-Lite,
 moe-16b), keep experts **resident** on GPU (`moe_device={"cuda":1}` +
-`gpu_expert_quant="int4"` + a large enough cache): Qwen1.5-MoE-A2.7B decodes at
-**~20 tok/s resident vs ~1 tok/s** when 75% of experts are offloaded to CPU (an
-18× gap — decode is upload-bound, not compute-bound, once experts leave VRAM).
-Offloaded MoE (the 671B case) needs a fused selective gather-GEMV kernel — see
-`docs/next-optimizations.md`.
+`gpu_expert_quant="int4"`). Then three levels of MoE decode on Qwen1.5-MoE-A2.7B:
+
+| Path | tok/s |
+|---|---|
+| offloaded (75% experts on CPU) | ~1 |
+| resident, eager per-expert (marlin) | ~19 |
+| resident, **fused selective kernel** | ~34 |
+| resident, **fused kernel + CUDA graph** | **~113** |
+
+The fused kernel (`fastllm_py/kernels/moe_int4.py`) runs only the routed experts
+in one launch pair with on-GPU routing; graph-capturing the whole MoE decode
+(`GraphDecoder`) then removes the per-token dispatch. Offloaded MoE (the 671B
+case) additionally needs prefetch/overlap — see `docs/next-optimizations.md`.
 
 ## Scope / what fits this host
 

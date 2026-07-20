@@ -77,11 +77,20 @@ a custom kernel can gather + dequant inline. **Status (2026-07-20):**
   routed FFN (48.5 vs 264 µs), one launch pair, reads only routed weights.
 - (5) wired into real decode — **Qwen1.5-MoE-A2.7B 18.8 → 33.7 tok/s (1.8×)**,
   tokens match the marlin path. (Decode-only; T>1 prefill falls back to eager.)
+- (6) capturable primitives — `gate_matvec` (fp16 gate, no cuBLAS) +
+  `fused_moe_weighted` (driven by an (E,) routing-weight vector so no index
+  extraction / D2H). Verified gate+route+fused captures as one graph.
+- (7) **graph-capture the whole MoE decode** in GraphDecoder (`_moe_branch`):
+  attention flash-decode + gate + routing + fused MoE + shared, all inside the
+  captured graph. **Qwen1.5-MoE 26 → 112.8 tok/s (4.33× graph-over-eager)**,
+  coherent output. Caveat: not bit-exact vs the fp16-shared eager path — the
+  shared expert is additionally INT4-quantized (fp16 FFN needs cuBLAS); a small
+  quality tradeoff, verify() confirms graph == its own execution.
 
-**Remaining:** graph-capture the fused MoE decode (route_gpu + fused_moe_ffn2
-are both capturable) for another lift like the dense path; batched (B>1) fused
-kernel; and the *offload* case (experts don't fit) still needs prefetch/overlap
-on top. This is a working first cut of the real ktransformers-style lever.
+**Remaining:** custom fp16 shared-FFN kernels for exact parity; batched (B>1)
+fused MoE; multi-GPU MoE graph; and the *offload* case (experts don't fit —
+671B) still needs prefetch/overlap on top of this. This is a working
+ktransformers-style lever end to end (fused kernel + graph capture).
 
 ## 3. FlashInfer paged attention + continuous batching
 

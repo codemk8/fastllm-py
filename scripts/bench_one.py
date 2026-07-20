@@ -38,6 +38,7 @@ def main():
         expert_dtype=cfg.get("expert_dtype", "float16"),
         gpu_cache_bytes=int(cfg.get("gpu_cache_gb", 8) * 2**30),
         gpu_expert_quant=cfg.get("gpu_expert_quant", "none"),
+        linear_quant=cfg.get("linear_quant", "none"),
     )
     load_s = time.time() - t0
 
@@ -57,16 +58,29 @@ def main():
     logits = cp.asarray(logits_host)
 
     # decode
-    nxt = int(cp.asnumpy(logits[-1]).argmax())
-    out = [nxt]
-    times = []
     n_decode = cfg.get("decode_tokens", 64)
-    for _ in range(n_decode):
-        t0 = time.time()
-        logits, kvs = model.forward(np.asarray([nxt]), kvs)
+    times = []
+    if cfg.get("cuda_graph"):
+        # graph decode replays the whole per-token step (INT4 dense, 1 GPU)
+        from fastllm_py.graph_decode import GraphDecoder
+
+        gd = GraphDecoder(model, max_len=len(ids) + n_decode + 8)
+        gd.capture()
+        first, pos = gd.prime(ids)
+        nxt = int(np.argmax(first))
+        for _ in range(n_decode):
+            t0 = time.time()
+            lo = gd.step(nxt, pos)
+            nxt = int(np.argmax(lo))
+            times.append(time.time() - t0)
+            pos += 1
+    else:
         nxt = int(cp.asnumpy(logits[-1]).argmax())
-        times.append(time.time() - t0)
-        out.append(nxt)
+        for _ in range(n_decode):
+            t0 = time.time()
+            logits, kvs = model.forward(np.asarray([nxt]), kvs)
+            nxt = int(cp.asnumpy(logits[-1]).argmax())
+            times.append(time.time() - t0)
     times = np.asarray(times)
 
     dev_id = 0
@@ -85,8 +99,9 @@ def main():
         "decode_p50": round(1 / float(np.median(times)), 2),
         "decode_worst": round(1 / times.max(), 2),
         "gpu_mem_gb": round((total - free) / 2**30, 1),
-        "sample": tok.decode(out[:24]),
     }
+    if cfg.get("cuda_graph"):
+        result["cuda_graph"] = True
     if hasattr(model, "_moe_shared"):
         c = model._moe_shared["cache"]
         result["cache_hit"] = round(c.hit_rate, 3)

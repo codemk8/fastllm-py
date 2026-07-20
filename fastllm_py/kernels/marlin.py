@@ -202,7 +202,8 @@ def get_workspace(size_n: int):
     return _workspaces[key]
 
 
-def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None):
+def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None,
+              workspace=None):
     """Lean marlin GEMV/GEMM for the decode hot path.
 
     Trusts that `a_fp16` is a contiguous fp16 array and that qweight/scales
@@ -221,6 +222,7 @@ def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None):
     size_m = a_fp16.shape[0]
     group_size = size_k // scales.shape[0]
     c = cp.empty((size_m, size_n), dtype=cp.float16)
+    ws = workspace if workspace is not None else get_workspace(size_n)
     if stream is not None:
         lib.FastllmCudaMarlinHalfInt4GemmStream(
             ctypes.c_void_p(int(a_fp16.data.ptr)),
@@ -230,7 +232,7 @@ def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None):
             ctypes.c_void_p(int(c.data.ptr)),
             ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
             ctypes.c_int(group_size),
-            ctypes.c_void_p(int(get_workspace(size_n).data.ptr)),
+            ctypes.c_void_p(int(ws.data.ptr)),
             ctypes.c_void_p(stream.ptr))
     else:
         lib.FastllmCudaMarlinHalfInt4Gemm(
@@ -241,7 +243,7 @@ def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None):
             ctypes.c_void_p(int(c.data.ptr)),
             ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
             ctypes.c_int(group_size),
-            ctypes.c_void_p(int(get_workspace(size_n).data.ptr)))
+            ctypes.c_void_p(int(ws.data.ptr)))
     return c
 
 

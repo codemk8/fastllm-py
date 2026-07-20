@@ -28,10 +28,11 @@ gd1 = GraphDecoder(m, max_len=256)
 s1 = gd1.generate(ids, max_new_tokens=N, use_graph=False)
 print("stage1 :", s1, "MATCH" if s1 == ref else "MISMATCH", flush=True)
 
-# Stage 2: CUDA graph
+# Stage 2: CUDA graph (auto-falls-back to eager if not bit-exact)
 gd2 = GraphDecoder(m, max_len=256)
 s2 = gd2.generate(ids, max_new_tokens=N, use_graph=True)
-print("stage2 :", s2, "MATCH" if s2 == ref else "MISMATCH", flush=True)
+mode = "eager-fallback" if gd2.graph_fellback else "graph"
+print("stage2 :", s2, "MATCH" if s2 == ref else "MISMATCH", f"[{mode}]", flush=True)
 
 # --- decode speed: eager model vs graph ---
 def bench(fn, n=64):

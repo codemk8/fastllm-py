@@ -23,44 +23,52 @@ concurrently.
 | Speed-estimator calibration (CPU/GPU crossover threshold) | ✅ |
 | FlashInfer paged attention, speculative decoding | ⏳ planned |
 
-## CUDA-graph decode (INT4, single GPU)
+## CUDA-graph decode (INT4)
 
 Capturing the whole per-token decode step as a CUDA graph and replaying it as
-one launch gives a large speedup on dispatch-bound decode — **bit-exact vs
-eager**, with a runtime verify + eager fallback (`fastllm_py/graph_decode.py`):
+one launch removes the Python/driver dispatch overhead that dominates decode —
+**bit-exact vs eager** (runtime `verify()` + eager fallback), any GPU count
+(one graph per device-segment). `fastllm_py/graph_decode.py`.
 
-| Model (INT4) | eager | graph | speedup |
-|---|---|---|---|
-| Qwen3-0.6B | 43 | **213** | 4.9× |
-| deepseek-coder-1.3b | 60 | **277** | 4.6× |
-| R1-Distill-Qwen-1.5B | 49 | **205** | 4.2× |
-| Qwen3-8B | 34 | **89** | 2.6× |
+| Model (INT4) | GPUs | eager | graph | speedup |
+|---|---|---|---|---|
+| Qwen3-0.6B | 1 | 43 | **211** | 4.9× |
+| deepseek-coder-1.3b | 1 | 60 | **277** | 4.6× |
+| Qwen3-8B | 1 | 33 | **89** | 2.7× |
+| deepseek-llm-67b | 2 | 14.3 | **19.0** | 1.33× |
 
-Full detail: `benchmarks/GRAPH_RESULTS.md`. Scope: dense non-MLA, single GPU.
+Speedup shrinks with width (bigger GEMMs are less dispatch-bound) but is a win
+everywhere. Full detail + the `max_len` sizing note: `benchmarks/GRAPH_RESULTS.md`.
 
-## Measured performance
+## Speculative decoding
 
-Dev box: 2× RTX 4090 (24 GB), 93 GB RAM. Single-stream greedy decode.
-See `benchmarks/RESULTS.md` for the full auto-generated table.
+Greedy speculative decoding (`fastllm_py/speculative.py`) — a small draft
+proposes γ tokens, the target verifies in one forward. Output is **identical to
+greedy target decoding**. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU:
+**1.53×** (γ=4, 68% draft acceptance; target forwards 96 → 30). Composes with
+graph decode.
 
-**Largest model on this host — deepseek-llm-67b-chat, INT4, split over both
-4090s: 12.9 tok/s decode** (21.4 + 18.2 GB VRAM; one-time 54 min quantize
-→ 32 GB on-disk cache, instant reload after). 236B+ MoE exceeds 93 GB RAM.
+## Serving
 
-Dense decode (fp32, one 4090), after the KV-cache / mask-skip / fused-kernel
-optimizations (~+17-30% over the first cut):
+OpenAI-compatible server auto-enables graph decode for INT4 dense models; each
+request's whole generation runs on one worker thread and streams via the loop.
+Qwen3-0.6B INT4 served at ~190 tok/s.
 
-| Model | decode tok/s |
-|---|---|
-| deepseek-coder-1.3b | 59.7 |
-| deepseek-llm-7b (fp16) | 36.6 |
-| R1-Distill-Qwen-1.5B | 46.0 |
-| Qwen3-0.6B | 43.1 |
+## MoE — residency, not offload, is the win
 
-Next levers for single-stream decode: giving Marlin a controllable stream
-(unblocks CUDA-graph capture of the decode step), a fused MoE kernel to kill
-the per-expert Python dispatch + per-layer routing syncs, and FlashInfer
-paged attention (also unlocks continuous batching).
+For MoE that fits in VRAM at INT4 (Qwen1.5-MoE experts 5.8 GB, V2-Lite,
+moe-16b), keep experts **resident** on GPU (`moe_device={"cuda":1}` +
+`gpu_expert_quant="int4"` + a large enough cache): Qwen1.5-MoE-A2.7B decodes at
+~26 tok/s, vs ~6 tok/s when 75% of experts are offloaded to CPU (upload-bound).
+Offloaded MoE (the 671B case) needs a fused selective gather-GEMV kernel — see
+`docs/next-optimizations.md`.
+
+## Scope / what fits this host
+
+2× RTX 4090 (24 GB), 93 GB RAM. Largest model: **deepseek-llm-67b INT4 across
+both GPUs** (~18 GB/GPU, 19 tok/s graph decode). 671B-class MoE (DeepSeek V4,
+GLM-5.2) does **not** fit even at INT4 (>300 GB weights) — needs a 256 GB+ RAM
+box; those also need new DSA sparse-attention code.
 
 ## Layout
 

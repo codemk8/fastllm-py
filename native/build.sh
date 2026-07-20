@@ -26,9 +26,27 @@ INCLUDES=(
 )
 
 echo "[build] nvcc: $NVCC   arch: $ARCH"
-echo "[build] compiling Marlin kernel ($MARLIN_SRC)"
+
+# Inject a stream-accepting GEMM entry into a COPY of the upstream file
+# (upstream tree is never modified). See native/marlin_stream_entry.inc.
+MARLIN_PATCHED="$HERE/_marlin_patched.cu"
+echo "[build] patching Marlin copy with stream entry"
+python3 - "$MARLIN_SRC" "$HERE/marlin_stream_entry.inc" "$MARLIN_PATCHED" <<'PY'
+import sys
+src, inc, out = sys.argv[1:4]
+text = open(src).read()
+snippet = open(inc).read()
+marker = "#undef TORCH_CHECK"
+assert marker in text, "expected #undef TORCH_CHECK marker in fastllm-marlin.cu"
+assert "FastllmCudaMarlinHalfInt4GemmStream" not in text, "already patched?"
+text = text.replace(marker, snippet + marker, 1)
+open(out, "w").write(text)
+print("  -> injected FastllmCudaMarlinHalfInt4GemmStream")
+PY
+
+echo "[build] compiling Marlin kernel ($MARLIN_PATCHED)"
 "$NVCC" -c -Xcompiler -fPIC -arch="$ARCH" -O3 -std=c++17 \
-    "${INCLUDES[@]}" "$MARLIN_SRC" -o "$HERE/fastllm-marlin.o"
+    "${INCLUDES[@]}" "$MARLIN_PATCHED" -o "$HERE/fastllm-marlin.o"
 
 echo "[build] compiling FP8 block128 kernels ($FP8_SRC)"
 "$NVCC" -c -Xcompiler -fPIC -arch="$ARCH" -O3 -std=c++17 \
@@ -39,6 +57,6 @@ echo "[build] linking $OUT"
     "$HERE/fastllm-marlin.o" "$HERE/fastllm_fp8_block128.o" \
     -lcudart -o "$OUT"
 
-rm -f "$HERE/fastllm-marlin.o" "$HERE/fastllm_fp8_block128.o"
+rm -f "$HERE/fastllm-marlin.o" "$HERE/fastllm_fp8_block128.o" "$MARLIN_PATCHED"
 echo "[build] done: $OUT"
 ls -l "$OUT"

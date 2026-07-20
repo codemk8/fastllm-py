@@ -80,8 +80,23 @@ def _load():
         ctypes.c_int,     # group_size
         ctypes.c_void_p,  # workspace (int32)
     ]
+
+    # stream-accepting twin (see native/marlin_stream_entry.inc); optional so
+    # older .so builds still load
+    if hasattr(lib, "FastllmCudaMarlinHalfInt4GemmStream"):
+        lib.FastllmCudaMarlinHalfInt4GemmStream.restype = ctypes.c_bool
+        lib.FastllmCudaMarlinHalfInt4GemmStream.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_void_p,  # cudaStream_t
+        ]
     _lib = lib
     return lib
+
+
+def has_stream_gemm() -> bool:
+    return hasattr(_load(), "FastllmCudaMarlinHalfInt4GemmStream")
 
 
 def available() -> bool:
@@ -187,14 +202,18 @@ def get_workspace(size_n: int):
     return _workspaces[key]
 
 
-def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k):
+def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k, stream=None):
     """Lean marlin GEMV/GEMM for the decode hot path.
 
     Trusts that `a_fp16` is a contiguous fp16 array and that qweight/scales
     (fp16)/zeros (uint32) were validated + made contiguous at load time —
     skips the per-call astype/ascontiguousarray/shape-validation that dominate
-    Python overhead when called ~hundreds of times per decode token. Ordering
-    is the caller's responsibility (marlin runs on legacy stream 0).
+    Python overhead when called ~hundreds of times per decode token.
+
+    stream: a cupy.cuda.Stream to launch on (via the stream-accepting entry).
+    None uses the legacy default stream (stream 0). Passing the surrounding
+    compute stream avoids the stream-0 device barrier and keeps the GEMM
+    capturable into a CUDA graph.
     """
     import cupy as cp
 
@@ -202,15 +221,27 @@ def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k):
     size_m = a_fp16.shape[0]
     group_size = size_k // scales.shape[0]
     c = cp.empty((size_m, size_n), dtype=cp.float16)
-    lib.FastllmCudaMarlinHalfInt4Gemm(
-        ctypes.c_void_p(int(a_fp16.data.ptr)),
-        ctypes.c_void_p(int(qweight.data.ptr)),
-        ctypes.c_void_p(int(scales.data.ptr)),
-        ctypes.c_void_p(int(zeros.data.ptr)),
-        ctypes.c_void_p(int(c.data.ptr)),
-        ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
-        ctypes.c_int(group_size),
-        ctypes.c_void_p(int(get_workspace(size_n).data.ptr)))
+    if stream is not None:
+        lib.FastllmCudaMarlinHalfInt4GemmStream(
+            ctypes.c_void_p(int(a_fp16.data.ptr)),
+            ctypes.c_void_p(int(qweight.data.ptr)),
+            ctypes.c_void_p(int(scales.data.ptr)),
+            ctypes.c_void_p(int(zeros.data.ptr)),
+            ctypes.c_void_p(int(c.data.ptr)),
+            ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
+            ctypes.c_int(group_size),
+            ctypes.c_void_p(int(get_workspace(size_n).data.ptr)),
+            ctypes.c_void_p(stream.ptr))
+    else:
+        lib.FastllmCudaMarlinHalfInt4Gemm(
+            ctypes.c_void_p(int(a_fp16.data.ptr)),
+            ctypes.c_void_p(int(qweight.data.ptr)),
+            ctypes.c_void_p(int(scales.data.ptr)),
+            ctypes.c_void_p(int(zeros.data.ptr)),
+            ctypes.c_void_p(int(c.data.ptr)),
+            ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
+            ctypes.c_int(group_size),
+            ctypes.c_void_p(int(get_workspace(size_n).data.ptr)))
     return c
 
 

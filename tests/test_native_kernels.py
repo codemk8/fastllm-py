@@ -127,3 +127,28 @@ def test_marlin_gemm_int4(size_m, size_k, size_n, gs):
     # Reference uses the exact same q/scale/zero, so this isolates repack +
     # permutation + kernel correctness -> should be near-exact.
     assert err < 0.02, f"Marlin rel-Frobenius error too high: {err}"
+
+
+@pytest.mark.skipif(not marlin.available() or not marlin.has_stream_gemm(),
+                    reason="stream-accepting Marlin entry missing")
+@pytest.mark.parametrize("size_m", [1, 16])
+def test_marlin_gemm_stream_matches_default(size_m):
+    """The stream-accepting entry must be bit-identical to the default one."""
+    size_k, size_n, gs = 2048, 1408, 128
+    rng = np.random.default_rng(7)
+    W = (rng.standard_normal((size_n, size_k)).astype(np.float32)) * 0.1
+    a = (rng.standard_normal((size_m, size_k)).astype(np.float32)) * 0.5
+    q, scale, zero, _ = _quant_int4_group(W, gs)
+    packed = marlin.marlin_repack(marlin.pack_gptq_qweight(cp.asarray(q), xp=cp),
+                                  size_k, size_n)
+    scales, zeros = marlin.build_marlin_scales_zeros(
+        cp.asarray(scale), cp.asarray(zero), gs, xp=cp)
+    a16 = cp.asarray(a, dtype=cp.float16)
+
+    default = marlin.gemm_fast(a16, packed, scales, zeros, size_n, size_k)
+    stream = cp.cuda.Stream(non_blocking=True)
+    with stream:
+        streamed = marlin.gemm_fast(a16, packed, scales, zeros, size_n, size_k,
+                                    stream=stream)
+    stream.synchronize()
+    cp.testing.assert_array_equal(default, streamed)

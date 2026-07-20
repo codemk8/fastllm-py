@@ -22,28 +22,34 @@ N = 24
 # single-stream references
 refs = [m.generate(np.asarray(p, dtype=np.int64), max_new_tokens=N) for p in prompts]
 
-bd = BatchedDecoder(m, batch_size=len(prompts), max_len=256)
-outs = bd.generate(prompts, max_new_tokens=N)
-ok = all(outs[b] == refs[b] for b in range(len(prompts)))
-print("correctness (each seq == single-stream):", "MATCH" if ok else "MISMATCH", flush=True)
-if not ok:
-    for b in range(len(prompts)):
-        if outs[b] != refs[b]:
-            print(f"  seq {b}: got {outs[b][:8]} ref {refs[b][:8]}")
+for mode in ("eager", "graph"):
+    bd = BatchedDecoder(m, batch_size=len(prompts), max_len=256)
+    outs = bd.generate(prompts, max_new_tokens=N, use_graph=(mode == "graph"))
+    ok = all(outs[b] == refs[b] for b in range(len(prompts)))
+    print(f"correctness [{mode}] (each seq == single-stream):",
+          "MATCH" if ok else "MISMATCH", flush=True)
+    if not ok:
+        for b in range(len(prompts)):
+            if outs[b] != refs[b]:
+                print(f"  seq {b}: got {outs[b][:8]} ref {refs[b][:8]}")
 
-# throughput scaling: aggregate tok/s at various batch sizes
+# throughput scaling: eager vs graph, aggregate tok/s at various batch sizes
 base = prompts[0]
 for B in (1, 4, 8, 16):
-    bd = BatchedDecoder(m, batch_size=B, max_len=256)
-    pl = [base] * B
-    bd.prime(pl)
-    cur = np.array([base[-1]] * B, dtype=np.int64)
-    bd.step(cur); cp.cuda.Device().synchronize()      # warm
-    t0 = time.time()
-    for _ in range(64):
-        logits = bd.step(cur); cur = logits.argmax(-1).astype(np.int64)
-    cp.cuda.Device().synchronize()
-    dt = time.time() - t0
-    print(f"B={B:2d}: {64/dt:6.1f} steps/s | aggregate {B*64/dt:7.1f} tok/s "
-          f"| per-seq {64/dt:6.1f} tok/s", flush=True)
+    line = f"B={B:2d}:"
+    for mode in ("eager", "graph"):
+        bd = BatchedDecoder(m, batch_size=B, max_len=256)
+        if mode == "graph":
+            bd.capture()
+        bd.prime([base] * B)
+        cur = np.array([base[-1]] * B, dtype=np.int64)
+        stepf = bd.step_graph if mode == "graph" else bd.step
+        stepf(cur); cp.cuda.Device().synchronize()      # warm
+        t0 = time.time()
+        for _ in range(64):
+            cur = stepf(cur).argmax(-1).astype(np.int64)
+        cp.cuda.Device().synchronize()
+        agg = B * 64 / (time.time() - t0)
+        line += f"  {mode} {agg:7.1f} tok/s"
+    print(line, flush=True)
 print("BATCHED_TEST_DONE")

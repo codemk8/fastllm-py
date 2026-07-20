@@ -120,6 +120,13 @@ class BatchedDecoder:
             self.v_cache = [cp.zeros((batch_size, max_len, KVH, D), dtype=self.dtype)
                             for _ in model.layers]
             self.cos_tab, self.sin_tab = model._rope_cache(cp.arange(max_len), D, cp)
+            # graph-capture state (increment 2)
+            self.stream = cp.cuda.Stream(non_blocking=True)
+            self.tok_buf = cp.zeros((batch_size,), dtype=cp.int32)   # graph input
+            self.hidden_out = cp.zeros((batch_size, cfg.hidden_dim), dtype=self.dtype)
+        self.graph = None
+        self._pool = None
+        self.ws_list, self.ws_i = [], 0
 
     def prime(self, prompt_list):
         """Prefill each sequence (eager, single-stream) and load its KV into the
@@ -140,9 +147,24 @@ class BatchedDecoder:
                 first[b] = int(np.argmax(row))
         return first
 
-    def step(self, tokens):
-        """One batched decode token. tokens: (B,) int (last token per sequence).
-        Advances pos, returns logits (B, vocab) as numpy."""
+    def _mm(self, inp, w):
+        """Batched marlin GEMV (M=B) on self.stream with a per-call workspace
+        (shared workspace corrupts a replayed graph)."""
+        from .kernels.marlin import gemm_fast, make_workspace
+
+        size_n = w["scales"].shape[1]
+        i = self.ws_i
+        if i >= len(self.ws_list):
+            self.ws_list.append(make_workspace(size_n, self.cp))
+        self.ws_i += 1
+        a = inp if inp.dtype == self.cp.float16 else inp.astype(self.cp.float16)
+        return gemm_fast(a, w["qweight"], w["scales"], w["zeros"], size_n,
+                         inp.shape[1], stream=self.stream, workspace=self.ws_list[i])
+
+    def _step_core(self):
+        """The whole batched decode step on self.stream, reading self.tok_buf /
+        self.pos and writing self.hidden_out. Increments pos (so a captured
+        graph auto-advances on replay). Static shapes; capturable."""
         cp = self.cp
         cfg = self.cfg
         H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
@@ -150,52 +172,100 @@ class BatchedDecoder:
         ctype = "float" if self.dtype == cp.float32 else "__half"
         wk, at = _bwrite_kv(cp, ctype), _battn(cp, ctype)
         row = KVH * D
+        self.ws_i = 0
+        self.pos += 1
+        posn = self.pos
+        x = self.model.embed[self.tok_buf].astype(self.dtype)   # (B, hidden)
+        cos = self.cos_tab[posn]
+        sin = self.sin_tab[posn]
+
+        def lin(name, inp, w):
+            o = self._mm(inp, w[f"{name}.weight"])
+            if f"{name}.bias" in w:
+                o = o + w[f"{name}.bias"]
+            return o
+
+        for li, layer in enumerate(self.model.layers):
+            w = layer.w
+            h = rmsnorm(x, w["input_layernorm.weight"], cfg.norm_eps)
+            q = lin("self_attn.q_proj", h, w).reshape(self.B, H, D)
+            k = lin("self_attn.k_proj", h, w).reshape(self.B, KVH, D)
+            v = lin("self_attn.v_proj", h, w).reshape(self.B, KVH, D)
+            if "self_attn.q_norm.weight" in w:
+                q = rmsnorm(q, w["self_attn.q_norm.weight"], cfg.norm_eps)
+                k = rmsnorm(k, w["self_attn.k_norm.weight"], cfg.norm_eps)
+            q = self._rope(q, cos, sin, H, D)
+            k = self._rope(k, cos, sin, KVH, D)
+
+            kc, vc = self.k_cache[li], self.v_cache[li]
+            wk(((row + 127) // 128, self.B), (128,),
+               (kc, vc, cp.ascontiguousarray(k), cp.ascontiguousarray(v),
+                posn, np.int32(self.B), np.int32(self.max_len), np.int32(row)))
+            qf = cp.ascontiguousarray(q.astype(cp.float32))
+            ctx = cp.empty((self.B, H, D), dtype=cp.float32)
+            at((H, self.B), (D,),
+               (qf, kc, vc, ctx, posn, np.int32(self.B), np.int32(H),
+                np.int32(KVH), np.int32(D), np.int32(self.max_len), np.float32(scale)),
+               shared_mem=2 * D * 4)
+            ctx = ctx.reshape(self.B, H * D).astype(self.dtype)
+            x = x + lin("self_attn.o_proj", ctx, w)
+
+            h = rmsnorm(x, w["post_attention_layernorm.weight"], cfg.norm_eps)
+            g = self._mm(h, w["mlp.gate_proj.weight"])
+            u = self._mm(h, w["mlp.up_proj.weight"])
+            x = x + self._mm(swiglu(g, u), w["mlp.down_proj.weight"])
+
+        self.hidden_out[:] = rmsnorm(x, self.model.final_norm, cfg.norm_eps)
+
+    def step(self, tokens):
+        """Eager batched step. tokens: (B,) int. Returns logits (B, vocab) np."""
+        cp = self.cp
+        with cp.cuda.Device(self.dev), self.stream:
+            self.tok_buf[:] = cp.asarray(tokens, dtype=cp.int32)
+            self._step_core()
+            logits = matmul_w(self.hidden_out, self.model.lm_head)
+        self.stream.synchronize()
+        return cp.asnumpy(logits)
+
+    def capture(self):
+        """Capture _step_core as a CUDA graph (dedicated pool + on-stream inputs,
+        same requirements as GraphDecoder)."""
+        cp = self.cp
         with cp.cuda.Device(self.dev):
-            self.pos += 1
-            x = self.model.embed[cp.asarray(tokens)].astype(self.dtype)  # (B, hidden)
-            posn = self.pos  # (B,)
-            cos = self.cos_tab[posn]  # (B, D/2)
-            sin = self.sin_tab[posn]
-            for li, layer in enumerate(self.model.layers):
-                w = layer.w
+            self._pool = cp.cuda.MemoryPool()
+            default_alloc = cp.get_default_memory_pool().malloc
+            cp.cuda.set_allocator(self._pool.malloc)
+            base = self.pos.copy()
+            try:
+                with self.stream:
+                    for _ in range(3):
+                        self.pos[:] = base          # warmup shouldn't advance state
+                        self._step_core()
+                self.stream.synchronize()
+                self.pos[:] = base
+                with self.stream:
+                    self.stream.begin_capture()
+                    self._step_core()
+                self.graph = self.stream.end_capture()
+            finally:
+                cp.cuda.set_allocator(default_alloc)
+            # warmup/capture wrote scratch K/V at base+1 — clear before real use
+            for c in self.k_cache:
+                c.fill(0)
+            for c in self.v_cache:
+                c.fill(0)
+            self.pos[:] = base
+            self.stream.synchronize()
 
-                def lin(name, inp):
-                    o = matmul_w(inp, w[f"{name}.weight"])
-                    if f"{name}.bias" in w:
-                        o = o + w[f"{name}.bias"]
-                    return o
-
-                h = rmsnorm(x, w["input_layernorm.weight"], cfg.norm_eps)
-                q = lin("self_attn.q_proj", h).reshape(self.B, H, D)
-                k = lin("self_attn.k_proj", h).reshape(self.B, KVH, D)
-                v = lin("self_attn.v_proj", h).reshape(self.B, KVH, D)
-                if "self_attn.q_norm.weight" in w:
-                    q = rmsnorm(q, w["self_attn.q_norm.weight"], cfg.norm_eps)
-                    k = rmsnorm(k, w["self_attn.k_norm.weight"], cfg.norm_eps)
-                q = self._rope(q, cos, sin, H, D)
-                k = self._rope(k, cos, sin, KVH, D)
-
-                kc, vc = self.k_cache[li], self.v_cache[li]
-                wk(((row + 127) // 128, self.B), (128,),
-                   (kc, vc, cp.ascontiguousarray(k), cp.ascontiguousarray(v),
-                    posn, np.int32(self.B), np.int32(self.max_len), np.int32(row)))
-                qf = cp.ascontiguousarray(q.astype(cp.float32))  # (B,H,D)
-                ctx = cp.empty((self.B, H, D), dtype=cp.float32)
-                at((H, self.B), (D,),
-                   (qf, kc, vc, ctx, posn, np.int32(self.B), np.int32(H),
-                    np.int32(KVH), np.int32(D), np.int32(self.max_len), np.float32(scale)),
-                   shared_mem=2 * D * 4)
-                ctx = ctx.reshape(self.B, H * D).astype(self.dtype)
-                x = x + lin("self_attn.o_proj", ctx)
-
-                h = rmsnorm(x, w["post_attention_layernorm.weight"], cfg.norm_eps)
-                g = matmul_w(h, w["mlp.gate_proj.weight"])
-                u = matmul_w(h, w["mlp.up_proj.weight"])
-                x = x + matmul_w(swiglu(g, u), w["mlp.down_proj.weight"])
-
-            x = rmsnorm(x, self.model.final_norm, cfg.norm_eps)
-            logits = matmul_w(x, self.model.lm_head)  # (B, vocab)
-            return cp.asnumpy(logits)
+    def step_graph(self, tokens):
+        """Graph-replay batched step; lm_head (cuBLAS) runs outside the graph."""
+        cp = self.cp
+        with cp.cuda.Device(self.dev), self.stream:
+            self.tok_buf[:] = cp.asarray(tokens, dtype=cp.int32)
+            self.graph.launch(self.stream)
+            logits = matmul_w(self.hidden_out, self.model.lm_head)
+        self.stream.synchronize()
+        return cp.asnumpy(logits)
 
     def _rope(self, t, cos, sin, nheads, D):
         """t: (B, nheads, D); cos/sin: (B, D/2) -> half-split rotate."""
@@ -208,12 +278,17 @@ class BatchedDecoder:
         out = cp.concatenate([t1 * c - t2 * s, t2 * c + t1 * s], axis=-1)
         return out.astype(t.dtype)
 
-    def generate(self, prompt_list, max_new_tokens: int = 32):
+    def generate(self, prompt_list, max_new_tokens: int = 32, use_graph: bool = False):
+        step = self.step
+        if use_graph:
+            if self.graph is None:
+                self.capture()   # before prime: warmup/clear must precede real KV
+            step = self.step_graph
         first = self.prime(prompt_list)
         outs = [[int(t)] for t in first]
         cur = first.copy()
         for _ in range(max_new_tokens - 1):
-            logits = self.step(cur)
+            logits = step(cur)
             cur = logits.argmax(-1).astype(np.int64)
             for b in range(self.B):
                 outs[b].append(int(cur[b]))

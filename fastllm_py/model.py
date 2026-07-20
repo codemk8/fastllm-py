@@ -255,6 +255,7 @@ class Model:
         cos, sin = self._rope_cache(positions, Dr, xp)
         q_pe = apply_rope(deinterleave_rope_input(q_pe), cos, sin)
         k_pe = apply_rope(deinterleave_rope_input(k_pe), cos, sin)
+        q = xp.concatenate([q_nope, q_pe], axis=-1)
 
         k = xp.concatenate([k_nope, xp.broadcast_to(k_pe, (T, H, Dr))], axis=-1)
         k_all, v_all = kv.append(xp.ascontiguousarray(k), xp.ascontiguousarray(v), xp)

@@ -63,12 +63,12 @@ class AsyncEngine:
         loop = asyncio.get_running_loop()
         while True:
             req = await self.requests.get()
-            t0 = time.time()
-            kvs = None
-            ids = np.asarray(req.token_ids, dtype=np.int64)
-            n_prompt = len(ids)
-            produced = 0
             try:
+                t0 = time.time()
+                kvs = None
+                ids = np.asarray(req.token_ids, dtype=np.int64)
+                n_prompt = len(ids)
+                produced = 0
                 logits, kvs = await loop.run_in_executor(
                     None, self.model.forward, ids, kvs)
                 t_prefill = time.time() - t0
@@ -90,6 +90,11 @@ class AsyncEngine:
                     "prefill_s": round(t_prefill, 3),
                     "decode_tok_s": round(produced / dt, 2) if dt > 0 else None,
                 }
+            except Exception as e:  # keep the worker alive; report per-request
+                import traceback
+
+                traceback.print_exc()
+                req.stats["error"] = repr(e)
             finally:
                 await req.queue.put(None)  # sentinel
                 req.done.set()

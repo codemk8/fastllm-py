@@ -16,12 +16,13 @@ def main():
     model_path = sys.argv[1] if len(sys.argv) > 1 else "models/Qwen3-0.6B"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "The capital of France is"
     n_new = int(sys.argv[3]) if len(sys.argv) > 3 else 32
+    dtype = sys.argv[4] if len(sys.argv) > 4 else "float32"
 
     tok = AutoTokenizer.from_pretrained(model_path)
     ids = np.asarray(tok(prompt).input_ids, dtype=np.int64)
 
     t0 = time.time()
-    model = Model.load(model_path, DeviceMap({"cuda:0": 1}), dtype="float32")
+    model = Model.load(model_path, DeviceMap({"cuda:0": 1}), dtype=dtype)
     print(f"[load {time.time()-t0:.1f}s] {model.cfg.model_type}: "
           f"{model.cfg.num_layers}L hidden={model.cfg.hidden_dim} "
           f"heads={model.cfg.num_heads}/{model.cfg.num_kv_heads} moe={model.cfg.is_moe}")

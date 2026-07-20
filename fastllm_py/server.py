@@ -38,6 +38,10 @@ async def chat_completions(body: dict):
     messages = body.get("messages", [])
     prompt_ids = tok.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True)
+    if hasattr(prompt_ids, "input_ids"):  # transformers>=5 returns BatchEncoding
+        prompt_ids = prompt_ids.input_ids
+    if prompt_ids and isinstance(prompt_ids[0], list):
+        prompt_ids = prompt_ids[0]
     req = GenRequest(
         token_ids=prompt_ids,
         max_new_tokens=int(body.get("max_tokens") or 512),

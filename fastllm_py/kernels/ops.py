@@ -12,8 +12,8 @@ def get_xp(x):
     return np if isinstance(x, np.ndarray) else __import__("cupy")
 
 
-# Flipped to True once _rmsnorm_cupy is verified on-GPU vs the numpy path.
-USE_FUSED_RMSNORM = False
+# Verified on-GPU vs numpy path (tests/test_fused_ops.py).
+USE_FUSED_RMSNORM = True
 
 
 def rmsnorm(x, weight, eps: float):
@@ -40,16 +40,18 @@ def _rmsnorm_cupy(x, weight, eps: float):
     global _rms_var_kernel, _rms_apply_kernel
     if _rms_var_kernel is None:
         _rms_var_kernel = cp.ReductionKernel(
-            "T x", "float32 y", "float32(x) * float32(x)", "a + b",
+            "T x", "float32 y",
+            "static_cast<float>(x) * static_cast<float>(x)", "a + b",
             "y = a", "0", "rms_meansq")
         _rms_apply_kernel = cp.ElementwiseKernel(
             "T x, float32 inv, W w", "T out",
-            "out = T(float32(x) * inv * float32(w))", "rms_apply")
+            "out = static_cast<T>(static_cast<float>(x) * inv "
+            "* static_cast<float>(w))", "rms_apply")
 
     dim = x.shape[-1]
     xf = x.reshape(-1, dim)
     meansq = _rms_var_kernel(xf, axis=1)          # (rows,) fp32
-    inv = cp.rsqrt(meansq / dim + cp.float32(eps))  # (rows,)
+    inv = 1.0 / cp.sqrt(meansq / dim + cp.float32(eps))  # (rows,)
     out = _rms_apply_kernel(xf, inv[:, None], weight[None, :])
     return out.reshape(x.shape)
 
@@ -128,7 +130,8 @@ def _swiglu_cupy(gate, up):
     if _swiglu_kernel is None:
         _swiglu_kernel = cp.ElementwiseKernel(
             "T g, U u", "T out",
-            "float32 gf = float32(g); out = T(gf / (1.0f + expf(-gf)) * float32(u));",
+            "float gf = static_cast<float>(g); "
+            "out = static_cast<T>(gf / (1.0f + expf(-gf)) * static_cast<float>(u));",
             "swiglu_fused")
     return _swiglu_kernel(gate, up)
 

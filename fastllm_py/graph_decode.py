@@ -38,6 +38,37 @@ from .kernels.ops import apply_rope, rmsnorm, swiglu
 from .model import matmul_w
 
 
+def route_gpu(logits, top_k, scoring="softmax", bias=None, n_group=0,
+              topk_group=0, norm=False, scale=1.0):
+    """On-GPU expert routing using ONLY capturable ops (exp/sort/where/sum —
+    no cuBLAS, no host sync), so it runs inside a CUDA graph. Returns a
+    (T, E) weight matrix, 0 for non-selected experts. Matches the CPU
+    expert_router.route_topk selection (incl. DeepSeek V3/V4 group-limited
+    routing) to float32 precision. Foundation for dense-over-experts graph
+    MoE decode (compute all E experts, weight-mask to the selected top-k)."""
+    import cupy as cp
+
+    T, E = logits.shape
+    if scoring == "sigmoid":
+        probs = 1.0 / (1.0 + cp.exp(-logits))
+        select = probs + (bias if bias is not None else 0.0)
+    else:
+        e = cp.exp(logits - logits.max(1, keepdims=True))
+        probs = e / e.sum(1, keepdims=True)
+        select = probs
+    if n_group > 1 and 0 < topk_group < n_group:
+        gsz = E // n_group
+        gs = select.reshape(T, n_group, gsz)
+        grp = cp.sort(gs, axis=-1)[:, :, -min(2, gsz):].sum(-1)
+        gthr = cp.sort(grp, axis=-1)[:, -topk_group][:, None]
+        select = cp.where(cp.repeat(grp >= gthr, gsz, axis=1), select, -cp.inf)
+    kth = cp.sort(select, axis=-1)[:, -top_k][:, None]
+    w = cp.where(select >= kth, probs, 0.0)
+    if norm:
+        w = w / (w.sum(1, keepdims=True) + 1e-20)
+    return (w * scale).astype(cp.float32)
+
+
 def graph_capable(model) -> bool:
     """True if GraphDecoder supports this model: INT4 (Marlin dict) linears,
     dense (non-MoE, non-MLA). Any number of GPUs."""

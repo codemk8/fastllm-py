@@ -25,3 +25,16 @@ def test_fused_rmsnorm_matches_reference(dtype, shape):
     atol = 2e-3 if dtype == np.float16 else 1e-5
     np.testing.assert_allclose(got.astype(np.float32), ref.astype(np.float32),
                                rtol=1e-3, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16])
+def test_fused_swiglu_matches_reference(dtype):
+    rng = np.random.default_rng(1)
+    g = rng.standard_normal((7, 256)).astype(dtype)
+    u = rng.standard_normal((7, 256)).astype(dtype)
+    gf = g.astype(np.float32)
+    ref = ((gf / (1.0 + np.exp(-gf))) * u.astype(np.float32)).astype(dtype)
+    got = cp.asnumpy(ops._swiglu_cupy(cp.asarray(g), cp.asarray(u)))
+    atol = 2e-3 if dtype == np.float16 else 1e-5
+    np.testing.assert_allclose(got.astype(np.float32), ref.astype(np.float32),
+                               rtol=1e-3, atol=atol)

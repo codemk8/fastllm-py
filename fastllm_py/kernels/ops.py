@@ -118,9 +118,26 @@ def apply_rope(q, cos, sin):
     return out.astype(q.dtype)
 
 
+_swiglu_kernel = None
+
+
+def _swiglu_cupy(gate, up):
+    import cupy as cp
+
+    global _swiglu_kernel
+    if _swiglu_kernel is None:
+        _swiglu_kernel = cp.ElementwiseKernel(
+            "T g, U u", "T out",
+            "float32 gf = float32(g); out = T(gf / (1.0f + expf(-gf)) * float32(u));",
+            "swiglu_fused")
+    return _swiglu_kernel(gate, up)
+
+
 def swiglu(gate, up):
     """silu(gate) * up, in fp32."""
     xp = get_xp(gate)
+    if USE_FUSED_RMSNORM and xp is not np:  # same verified-then-flip gate
+        return _swiglu_cupy(gate, up)
     g = gate.astype(xp.float32)
     return ((g / (1.0 + xp.exp(-g))) * up.astype(xp.float32)).astype(gate.dtype)
 

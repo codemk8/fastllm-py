@@ -55,9 +55,11 @@ def to_device(x, device: str):
 def matmul_w(x, w):
     """x @ W.T for either a plain (out, in) array or a Marlin INT4 payload."""
     if isinstance(w, dict):
-        from .kernels.marlin import marlin_gemm_int4
+        from .kernels.marlin import gemm_fast
 
-        return marlin_gemm_int4(x, w["qweight"], w["scales"], w["zeros"], sync=False)
+        return gemm_fast(x if x.dtype.itemsize == 2 else x.astype("float16"),
+                         w["qweight"], w["scales"], w["zeros"],
+                         w["scales"].shape[1], x.shape[1])
     return x @ w.T
 
 

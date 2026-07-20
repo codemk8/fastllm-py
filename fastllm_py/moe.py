@@ -59,22 +59,24 @@ def build_marlin_expert_payload(w_fp16: dict, group_size: int = 128) -> dict:
     return payload
 
 
-def _expert_ffn_marlin(x_fp16, w, workspaces):
-    """Marlin INT4 expert ffn. w: uploaded payload dict (GPU arrays)."""
-    from .kernels import marlin
+def _expert_ffn_marlin(x_fp16, w):
+    """Marlin INT4 expert ffn. w: uploaded payload dict (GPU arrays).
 
-    def mm(proj, inp):
-        size_n = w[f"{proj}.scales"].shape[1]
-        # sync=False: the caller's compute_stream.synchronize() (once per
-        # MoE layer) provides ordering; a per-GEMM deviceSynchronize would
-        # serialize ~288 stalls per decode token
-        return marlin.marlin_gemm_int4(
-            inp, w[f"{proj}.qweight"], w[f"{proj}.scales"], w[f"{proj}.zeros"],
-            workspaces[size_n], size_n=size_n, sync=False)
+    Uses marlin.gemm_fast (lean, no per-call conversions/validation) since
+    payloads are pre-validated + contiguous. Ordering is provided by the
+    caller's per-layer compute_stream.synchronize(), not per-GEMM syncs.
+    """
+    from .kernels.marlin import gemm_fast
 
-    g = mm("gate", x_fp16)
-    u = mm("up", x_fp16)
-    return mm("down", swiglu(g, u))
+    hidden = x_fp16.shape[1]
+    inter = w["gate.scales"].shape[1]
+    g = gemm_fast(x_fp16, w["gate.qweight"], w["gate.scales"], w["gate.zeros"],
+                  inter, hidden)
+    u = gemm_fast(x_fp16, w["up.qweight"], w["up.scales"], w["up.zeros"],
+                  inter, hidden)
+    act = swiglu(g, u)
+    return gemm_fast(act, w["down.qweight"], w["down.scales"], w["down.zeros"],
+                     hidden, inter)
 
 
 class MoELayer:
@@ -93,7 +95,6 @@ class MoELayer:
         self.e_score_bias = e_score_bias        # DeepSeek V3 e_score_correction_bias
         self.experts_cpu = expert_weights_cpu   # eid -> {gate,up,down} np arrays or callable
         self.gpu_payloads = gpu_payloads        # eid -> marlin int4 payload (or None=fp16)
-        self._workspaces: dict[int, object] = {}
         self.placement = placement
         self.cache = cache
         self.estimator = estimator
@@ -119,13 +120,6 @@ class MoELayer:
         return self.cache.get_or_upload((self.layer_idx, eid),
                                         self._payload_source(eid))
 
-    def _workspace(self, size_n: int):
-        if size_n not in self._workspaces:
-            from .kernels import marlin
-
-            self._workspaces[size_n] = marlin.make_workspace(size_n, self.cp)
-        return self._workspaces[size_n]
-
     def _materialize_cpu(self, eid: int):
         w = self.experts_cpu[eid]
         return w() if callable(w) else w
@@ -137,16 +131,21 @@ class MoELayer:
             x16 = x_gpu.astype(cp.float16) if marlin_mode else None
             for t in tasks:
                 w = self._gpu_expert_weights(t.expert_id)
-                idx = cp.asarray(t.token_idx)
+                single = t.token_idx.shape[0] == 1
+                idx = int(t.token_idx[0]) if single else cp.asarray(t.token_idx)
+                xin = (x16 if marlin_mode else x_gpu)[idx]
+                if single:
+                    xin = xin[None]  # (1, hidden)
                 wgt = cp.asarray(t.weights)[:, None]
                 if marlin_mode:
-                    ws = {s.shape[1]: self._workspace(s.shape[1])
-                          for k, s in w.items() if k.endswith(".scales")}
-                    y = _expert_ffn_marlin(x16[idx], w, ws).astype(cp.float32) * wgt
+                    y = _expert_ffn_marlin(xin, w).astype(cp.float32) * wgt
                 else:
-                    y = _expert_ffn(x_gpu[idx], w, cp) * wgt
-                # scatter-add (indices within one expert are unique)
-                cp.add.at(out_gpu, idx, y.astype(out_gpu.dtype))
+                    y = _expert_ffn(xin, w, cp) * wgt
+                y = y.astype(out_gpu.dtype)
+                if single:  # decode: single token, direct indexed add
+                    out_gpu[idx] += y[0]
+                else:  # prefill: unique indices within an expert
+                    cp.add.at(out_gpu, idx, y)
 
     def _run_cpu_experts(self, x_cpu, tasks: list[ExpertTask]):
         out = np.zeros_like(x_cpu, dtype=np.float32)

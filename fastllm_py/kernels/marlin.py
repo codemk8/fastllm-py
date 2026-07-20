@@ -187,6 +187,33 @@ def get_workspace(size_n: int):
     return _workspaces[key]
 
 
+def gemm_fast(a_fp16, qweight, scales, zeros, size_n, size_k):
+    """Lean marlin GEMV/GEMM for the decode hot path.
+
+    Trusts that `a_fp16` is a contiguous fp16 array and that qweight/scales
+    (fp16)/zeros (uint32) were validated + made contiguous at load time —
+    skips the per-call astype/ascontiguousarray/shape-validation that dominate
+    Python overhead when called ~hundreds of times per decode token. Ordering
+    is the caller's responsibility (marlin runs on legacy stream 0).
+    """
+    import cupy as cp
+
+    lib = _lib or _load()
+    size_m = a_fp16.shape[0]
+    group_size = size_k // scales.shape[0]
+    c = cp.empty((size_m, size_n), dtype=cp.float16)
+    lib.FastllmCudaMarlinHalfInt4Gemm(
+        ctypes.c_void_p(int(a_fp16.data.ptr)),
+        ctypes.c_void_p(int(qweight.data.ptr)),
+        ctypes.c_void_p(int(scales.data.ptr)),
+        ctypes.c_void_p(int(zeros.data.ptr)),
+        ctypes.c_void_p(int(c.data.ptr)),
+        ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
+        ctypes.c_int(group_size),
+        ctypes.c_void_p(int(get_workspace(size_n).data.ptr)))
+    return c
+
+
 def marlin_gemm_int4(a_fp16, packed_weights, scales, zeros, workspace=None,
                      size_n=None, sync=True):
     """Marlin uint4 GEMM.

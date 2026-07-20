@@ -204,6 +204,7 @@ class MoELayer:
             norm_topk_prob=cfg.norm_topk_prob, scoring=cfg.scoring_func,
             routed_scaling=cfg.routed_scaling_factor,
             e_score_bias=self.e_score_bias,
+            n_group=cfg.n_group, topk_group=cfg.topk_group,
         )
         self.freq *= 0.98
         for t in tasks:

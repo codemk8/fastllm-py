@@ -21,11 +21,16 @@ class ExpertTask:
 
 def route_topk(scores: np.ndarray, top_k: int, *, norm_topk_prob: bool = False,
                scoring: str = "softmax", routed_scaling: float = 1.0,
-               e_score_bias: np.ndarray | None = None) -> list[ExpertTask]:
+               e_score_bias: np.ndarray | None = None,
+               n_group: int = 0, topk_group: int = 0) -> list[ExpertTask]:
     """scores: (T, num_experts) raw gate logits (fp32, on CPU).
 
-    Returns one ExpertTask per activated expert. Handles both softmax
-    (Qwen/Mixtral) and sigmoid+bias (DeepSeek V3) scoring.
+    Returns one ExpertTask per activated expert. Handles softmax (Qwen/Mixtral)
+    and sigmoid+bias (DeepSeek V3) scoring, plus DeepSeek V3/V4 group-limited
+    (node-limited) routing: experts are partitioned into n_group groups; only
+    the top `topk_group` groups (scored by the sum of their top-2 experts) are
+    eligible, then top-k runs within the survivors. The routing WEIGHT is the
+    raw score (softmax prob / sigmoid) — the bias only affects selection.
     """
     T, E = scores.shape
     if scoring == "sigmoid":
@@ -36,6 +41,16 @@ def route_topk(scores: np.ndarray, top_k: int, *, norm_topk_prob: bool = False,
         e = np.exp(scores - m)
         probs = e / e.sum(-1, keepdims=True)
         select = probs
+
+    if n_group and n_group > 1 and 0 < topk_group < n_group:
+        gsz = E // n_group
+        gs = select.reshape(T, n_group, gsz)
+        ntop = min(2, gsz)                       # V3 group score = sum of top-2
+        group_score = np.sort(gs, axis=-1)[:, :, -ntop:].sum(-1)   # (T, n_group)
+        keep = np.argpartition(-group_score, topk_group - 1, axis=-1)[:, :topk_group]
+        masked = np.ones((T, n_group), dtype=bool)
+        np.put_along_axis(masked, keep, False, axis=-1)            # True = drop
+        select = np.where(np.repeat(masked, gsz, axis=1), -np.inf, select)
 
     topk_idx = np.argpartition(-select, top_k - 1, axis=-1)[:, :top_k]  # (T, k)
     topk_w = np.take_along_axis(probs, topk_idx, axis=-1)

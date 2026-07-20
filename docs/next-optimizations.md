@@ -40,8 +40,8 @@ D2H sync moved on-device — see #2).
 **Measured correction (2026-07-20): the MoE floor was NOT Python dispatch — it
 was expert upload/cache-thrash.** With all experts made INT4-**resident** on
 GPU (`moe_device={"cuda":1}` + `gpu_expert_quant="int4"` + a cache big enough
-to hold them), Qwen1.5-MoE-A2.7B eager decode is **~25.7 tok/s** — vs the
-~6.4 tok/s benchmark that offloaded 75% of experts to CPU (upload-bound). So
+to hold them), Qwen1.5-MoE-A2.7B eager decode is **~20 tok/s** — vs ~1 tok/s
+when 75% of experts are offloaded to CPU (an 18× gap; upload-bound). So
 for MoE that **fits in VRAM at INT4** (Qwen1.5-MoE experts = 5.8 GB, V2-Lite,
 moe-16b all fit), the win is simply residency — no kernel work needed. Use the
 resident config.

@@ -59,7 +59,8 @@ Qwen3-0.6B INT4 served at ~190 tok/s.
 For MoE that fits in VRAM at INT4 (Qwen1.5-MoE experts 5.8 GB, V2-Lite,
 moe-16b), keep experts **resident** on GPU (`moe_device={"cuda":1}` +
 `gpu_expert_quant="int4"` + a large enough cache): Qwen1.5-MoE-A2.7B decodes at
-~26 tok/s, vs ~6 tok/s when 75% of experts are offloaded to CPU (upload-bound).
+**~20 tok/s resident vs ~1 tok/s** when 75% of experts are offloaded to CPU (an
+18× gap — decode is upload-bound, not compute-bound, once experts leave VRAM).
 Offloaded MoE (the 671B case) needs a fused selective gather-GEMV kernel — see
 `docs/next-optimizations.md`.
 

@@ -27,34 +27,35 @@ def _expert_ffn(x, w, xp):
 
 
 # ---------------------------------------------------------------- marlin int4
-def build_marlin_expert_payload(w_fp16: dict, group_size: int = 128) -> dict:
-    """Quantize one expert's {gate,up,down} to Marlin INT4 format.
-
-    Returns a flat dict of numpy arrays ("<proj>.qweight/.scales/.zeros")
-    ready for direct upload — repack and permutation are done here once
-    (device repack, result downloaded), so runtime upload is a plain memcpy
-    at ~1/4 the fp16 size.
-    """
+def quantize_marlin_matrix(w, group_size: int = 128) -> dict:
+    """Quantize one (out, in) float matrix to upload-ready Marlin INT4:
+    {"qweight": uint32, "scales": fp16, "zeros": uint32} numpy arrays.
+    Repack and permutations are done here once (device repack, downloaded),
+    so runtime upload is a plain memcpy at ~1/4 the fp16 size."""
     import cupy as cp
 
     from .kernels import marlin
 
+    size_n, size_k = w.shape
+    g = w.astype(np.float32).reshape(size_n, size_k // group_size, group_size)
+    wmin, wmax = g.min(axis=2), g.max(axis=2)
+    scale = (wmax - wmin) / 15.0
+    scale = np.where(scale == 0, 1.0, scale).astype(np.float32)
+    zero = np.clip(np.rint(-wmin / scale), 0, 15).astype(np.int64)
+    q = np.clip(np.rint(g / scale[:, :, None]) + zero[:, :, None], 0, 15
+                ).astype(np.uint8).reshape(size_n, size_k)
+    packed = marlin.pack_gptq_qweight(q)
+    repacked = cp.asnumpy(marlin.marlin_repack(cp.asarray(packed), size_k, size_n))
+    scales, zeros = marlin.build_marlin_scales_zeros(scale, zero, group_size)
+    return {"qweight": repacked, "scales": scales, "zeros": zeros}
+
+
+def build_marlin_expert_payload(w_fp16: dict, group_size: int = 128) -> dict:
+    """Quantize one expert's {gate,up,down}: flat "<proj>.qweight/..." dict."""
     payload = {}
     for proj, w in w_fp16.items():
-        size_n, size_k = w.shape
-        g = w.astype(np.float32).reshape(size_n, size_k // group_size, group_size)
-        wmin, wmax = g.min(axis=2), g.max(axis=2)
-        scale = (wmax - wmin) / 15.0
-        scale = np.where(scale == 0, 1.0, scale).astype(np.float32)
-        zero = np.clip(np.rint(-wmin / scale), 0, 15).astype(np.int64)
-        q = np.clip(np.rint(g / scale[:, :, None]) + zero[:, :, None], 0, 15
-                    ).astype(np.uint8).reshape(size_n, size_k)
-        packed = marlin.pack_gptq_qweight(q)
-        repacked = cp.asnumpy(marlin.marlin_repack(cp.asarray(packed), size_k, size_n))
-        scales, zeros = marlin.build_marlin_scales_zeros(scale, zero, group_size)
-        payload[f"{proj}.qweight"] = repacked
-        payload[f"{proj}.scales"] = scales
-        payload[f"{proj}.zeros"] = zeros
+        for k, v in quantize_marlin_matrix(w, group_size).items():
+            payload[f"{proj}.{k}"] = v
     return payload
 
 

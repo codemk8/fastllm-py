@@ -43,11 +43,32 @@ def dev_ctx(device: str):
 def to_device(x, device: str):
     import cupy as cp
 
+    if isinstance(x, dict):  # marlin payload: upload each buffer
+        return {k: to_device(v, device) for k, v in x.items()}
     if device.startswith("cuda"):
         dev_id = int(device.split(":")[1]) if ":" in device else 0
         with cp.cuda.Device(dev_id):
             return cp.asarray(x)
     return cp.asnumpy(x) if isinstance(x, cp.ndarray) else x
+
+
+def matmul_w(x, w):
+    """x @ W.T for either a plain (out, in) array or a Marlin INT4 payload."""
+    if isinstance(w, dict):
+        from .kernels.marlin import marlin_gemm_int4
+
+        return marlin_gemm_int4(x, w["qweight"], w["scales"], w["zeros"], sync=False)
+    return x @ w.T
+
+
+# linear weights eligible for INT4 quantization (dims permitting)
+_QUANT_SUFFIXES = (
+    "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+    "self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight",
+    "self_attn.kv_a_proj_with_mqa.weight", "self_attn.kv_b_proj.weight",
+    "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+)
 
 
 @dataclass
@@ -95,17 +116,46 @@ class Model:
     def load(cls, model_path: str, device_map: DeviceMap | None = None,
              dtype: str = "float32", moe_device: "MoeDeviceMap | None" = None,
              expert_dtype: str = "float16", gpu_cache_bytes: int = 8 << 30,
-             gpu_expert_quant: str = "none") -> "Model":
+             gpu_expert_quant: str = "none", linear_quant: str = "none") -> "Model":
+        from pathlib import Path
+
         from .config import load_config
 
+        if linear_quant == "int4":
+            dtype = "float16"  # marlin computes in fp16
         cfg = load_config(model_path)
         store = WeightStore(model_path, bf16_to="float32")
         m = cls(cfg, dtype)
         devices = (device_map or DeviceMap({"cuda:0": 1})).assign(cfg.num_layers)
+        cache_dir = Path(model_path) / ".marlin_cache"
+
+        def quantizable(key, shape):
+            return (linear_quant == "int4"
+                    and any(key.endswith(s) for s in _QUANT_SUFFIXES)
+                    and len(shape) == 2
+                    and shape[0] % 64 == 0 and shape[1] % 128 == 0)
 
         def up(key, device):
-            t = store.get(key).astype(dtype)
-            return to_device(t, device)
+            import numpy as _np
+
+            from .moe import quantize_marlin_matrix
+
+            t = None
+            if linear_quant == "int4":
+                cpath = cache_dir / (key + ".npz")
+                if cpath.exists():
+                    z = _np.load(cpath)
+                    return to_device({k: z[k] for k in z.files}, device)
+                t = store.get(key)
+                if quantizable(key, t.shape):
+                    payload = quantize_marlin_matrix(t.astype(_np.float16))
+                    cache_dir.mkdir(exist_ok=True)
+                    cpath.parent.mkdir(parents=True, exist_ok=True)
+                    _np.savez(cpath, **payload)
+                    return to_device(payload, device)
+            if t is None:
+                t = store.get(key)
+            return to_device(t.astype(dtype), device)
 
         prefix = "model." if "model.embed_tokens.weight" in store else ""
         first_dev, last_dev = devices[0], devices[-1]
@@ -251,19 +301,19 @@ class Model:
         Dq = Dn + Dr
 
         if layer.has("self_attn.q_a_proj.weight"):  # V3 / big V2
-            qa = x @ layer.w["self_attn.q_a_proj.weight"].T
+            qa = matmul_w(x, layer.w["self_attn.q_a_proj.weight"])
             qa = rmsnorm(qa, layer.w["self_attn.q_a_layernorm.weight"], cfg.norm_eps)
-            q = qa @ layer.w["self_attn.q_b_proj.weight"].T
+            q = matmul_w(qa, layer.w["self_attn.q_b_proj.weight"])
         else:  # V2-Lite
-            q = x @ layer.w["self_attn.q_proj.weight"].T
+            q = matmul_w(x, layer.w["self_attn.q_proj.weight"])
         q = q.reshape(T, H, Dq)
         q_nope, q_pe = q[..., :Dn], q[..., Dn:]
 
-        ckv = x @ layer.w["self_attn.kv_a_proj_with_mqa.weight"].T  # (T, R+Dr)
+        ckv = matmul_w(x, layer.w["self_attn.kv_a_proj_with_mqa.weight"])  # (T, R+Dr)
         R = cfg.kv_lora_rank
         c_kv, k_pe = ckv[:, :R], ckv[:, R:].reshape(T, 1, Dr)
         c_kv = rmsnorm(c_kv, layer.w["self_attn.kv_a_layernorm.weight"], cfg.norm_eps)
-        kv_out = (c_kv @ layer.w["self_attn.kv_b_proj.weight"].T).reshape(T, H, Dn + Dv)
+        kv_out = matmul_w(c_kv, layer.w["self_attn.kv_b_proj.weight"]).reshape(T, H, Dn + Dv)
         k_nope, v = kv_out[..., :Dn], kv_out[..., Dn:]
 
         cos, sin = self._rope_cache(positions, Dr, xp)
@@ -280,7 +330,7 @@ class Model:
                                 float(cfg.rope_scaling["mscale_all_dim"]))
             scale *= m * m
         ctx = self._sdpa(q, k_all, v_all, scale, xp).astype(x.dtype)
-        return ctx @ layer.w["self_attn.o_proj.weight"].T
+        return matmul_w(ctx, layer.w["self_attn.o_proj.weight"])
 
     def _attention(self, layer: DecoderLayer, x, positions, kv: KVCache):
         if layer.has("self_attn.kv_a_proj_with_mqa.weight"):
@@ -291,7 +341,7 @@ class Model:
         H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
 
         def lin(name, inp):
-            out = inp @ layer.w[f"{name}.weight"].T
+            out = matmul_w(inp, layer.w[f"{name}.weight"])
             if layer.has(f"{name}.bias"):
                 out = out + layer.w[f"{name}.bias"]
             return out
@@ -316,9 +366,9 @@ class Model:
         return lin("self_attn.o_proj", ctx)
 
     def _mlp(self, layer: DecoderLayer, x):
-        g = x @ layer.w["mlp.gate_proj.weight"].T
-        u = x @ layer.w["mlp.up_proj.weight"].T
-        return swiglu(g, u) @ layer.w["mlp.down_proj.weight"].T
+        g = matmul_w(x, layer.w["mlp.gate_proj.weight"])
+        u = matmul_w(x, layer.w["mlp.up_proj.weight"])
+        return matmul_w(swiglu(g, u), layer.w["mlp.down_proj.weight"])
 
     def forward(self, token_ids: np.ndarray, kv_caches: list[KVCache] | None = None):
         """token_ids: (T,) int64 for a single sequence. Returns (T, vocab) logits

@@ -174,7 +174,21 @@ def marlin_repack(std_qweight, size_k, size_n):
     return out
 
 
-def marlin_gemm_int4(a_fp16, packed_weights, scales, zeros, workspace, size_n=None):
+_workspaces: dict = {}  # (device_id, size_n) -> zeroed int32 workspace
+
+
+def get_workspace(size_n: int):
+    """Shared per-device workspace (Marlin self-resets it between calls)."""
+    import cupy as cp
+
+    key = (cp.cuda.Device().id, size_n)
+    if key not in _workspaces:
+        _workspaces[key] = make_workspace(size_n, cp)
+    return _workspaces[key]
+
+
+def marlin_gemm_int4(a_fp16, packed_weights, scales, zeros, workspace=None,
+                     size_n=None, sync=True):
     """Marlin uint4 GEMM.
 
     a_fp16          : cupy fp16 [size_m, size_k]  (row-major activations)
@@ -193,6 +207,8 @@ def marlin_gemm_int4(a_fp16, packed_weights, scales, zeros, workspace, size_n=No
     num_groups = scales.shape[0]
     if size_n is None:
         size_n = scales.shape[1]
+    if workspace is None:
+        workspace = get_workspace(size_n)
     group_size = size_k // num_groups
 
     if size_n % 64 != 0 or size_k % 64 != 0:
@@ -215,7 +231,8 @@ def marlin_gemm_int4(a_fp16, packed_weights, scales, zeros, workspace, size_n=No
         ctypes.c_int(size_m), ctypes.c_int(size_n), ctypes.c_int(size_k),
         ctypes.c_int(group_size),
         ctypes.c_void_p(int(workspace.data.ptr)))
-    cp.cuda.runtime.deviceSynchronize()
+    if sync:  # launches go to the legacy null stream: stream-ordered vs
+        cp.cuda.runtime.deviceSynchronize()  # blocking streams either way
     if not ok:
         raise RuntimeError("FastllmCudaMarlinHalfInt4Gemm returned false "
                            "(unsupported device or shape)")

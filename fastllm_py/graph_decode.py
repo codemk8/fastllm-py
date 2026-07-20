@@ -268,37 +268,43 @@ class GraphDecoder:
         self._captured = True
 
     # ------------------------------------------------------------- stepping
-    def _set_seg_inputs(self, seg, x_host, token_id, position):
-        """On seg.stream: fill this segment's input (embedding for seg 0, or the
-        prev segment's boundary hidden for others) + position + mask."""
-        cp = self.cp
-        with cp.cuda.Device(seg.dev_id), seg.stream:
-            if x_host is None:  # first segment: input is the token embedding
-                seg.x_in[0] = self.model.embed[token_id].astype(self.dtype)
-            else:
-                seg.x_in.set(x_host[None])
-            seg.pos_idx[0] = position
-            seg.bias[position] = 0.0
-
     def _run(self, token_id, position, graph: bool):
-        """One decode token across all segments; returns logits (numpy)."""
+        """One decode token across all segments; returns logits (numpy).
+
+        Segments are pipelined with CUDA events + async cross-device copies of
+        the boundary hidden state — a single host sync at the very end. Per-
+        segment syncs would otherwise dominate for large models (where each
+        segment's GPU work is big and the dispatch savings are small)."""
         cp = self.cp
-        x_host = None
-        for si, seg in enumerate(self.segments):
-            self._set_seg_inputs(seg, x_host, token_id, position)
-            with cp.cuda.Device(seg.dev_id):
+        segs = self.segments
+        prev_done = None  # event: prev segment's output hidden is ready
+        for si, seg in enumerate(segs):
+            with cp.cuda.Device(seg.dev_id), seg.stream:
+                if si == 0:
+                    seg.x_in[0] = self.model.embed[token_id].astype(self.dtype)
+                else:
+                    # boundary hidden: prev.hidden_out (dev si-1) -> x_in (dev si),
+                    # async on seg.stream, ordered after prev_done (cross-device
+                    # event wait). memcpyPeerAsync works without P2P (host-staged).
+                    seg.stream.wait_event(prev_done)
+                    prev = segs[si - 1]
+                    nbytes = seg.x_in.size * seg.x_in.itemsize
+                    cp.cuda.runtime.memcpyPeerAsync(
+                        seg.x_in.data.ptr, seg.dev_id,
+                        prev.hidden_out.data.ptr, prev.dev_id,
+                        nbytes, seg.stream.ptr)
+                seg.pos_idx[0] = position
+                seg.bias[position] = 0.0
                 if graph:
                     seg.graph.launch(seg.stream)
                 else:
-                    with seg.stream:
-                        self._segment_step(seg)
-                seg.stream.synchronize()
-                if not seg.is_last:  # hop boundary hidden to the next device
-                    x_host = cp.asnumpy(seg.hidden_out)
-        last = self.segments[-1]
+                    self._segment_step(seg)
+                prev_done = cp.cuda.Event()
+                prev_done.record(seg.stream)
+        last = segs[-1]
         with cp.cuda.Device(last.dev_id), last.stream:
             logits = matmul_w(last.hidden_out[None], self.model.lm_head)[0]
-        last.stream.synchronize()
+        last.stream.synchronize()  # the one and only host sync per token
         return cp.asnumpy(logits)
 
     def step(self, token_id, position):

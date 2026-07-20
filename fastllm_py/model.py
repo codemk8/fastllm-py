@@ -448,10 +448,46 @@ class Model:
         return logits, kv_caches
 
     # ------------------------------------------------------------ generate
-    def generate(self, token_ids, max_new_tokens: int = 32, temperature: float = 0.0):
+    def _get_graph_decoder(self):
+        """Lazily build + cache a GraphDecoder for the fast greedy decode path.
+        Returns None if this model isn't graph-capable or capture fails."""
+        gd = getattr(self, "_graph_decoder", None)
+        if gd is not None:
+            return gd
+        if getattr(self, "_graph_decoder_failed", False):
+            return None
+        try:
+            from .graph_decode import GraphDecoder, graph_capable
+            if not graph_capable(self):
+                self._graph_decoder_failed = True
+                return None
+            gd = GraphDecoder(self)
+            self._graph_decoder = gd
+            return gd
+        except Exception:
+            self._graph_decoder_failed = True
+            return None
+
+    def generate(self, token_ids, max_new_tokens: int = 32, temperature: float = 0.0,
+                 use_graph: bool = True, stop_ids=None):
         import cupy as cp
 
         ids = list(token_ids)
+
+        # Fastest path by default: greedy decode auto-routes to the captured
+        # CUDA-graph decoder when the model supports it (INT4 dense / resident-
+        # INT4 MoE, all-CUDA, non-MLA). Falls back to eager for sampling, when
+        # not graph-capable, or if capture/verify fails.
+        if use_graph and temperature == 0.0:
+            gd = self._get_graph_decoder()
+            if gd is not None:
+                try:
+                    return gd.generate(np.asarray(ids, dtype=np.int64),
+                                       max_new_tokens=max_new_tokens, use_graph=True,
+                                       stop_ids=stop_ids)
+                except Exception:
+                    pass  # fall through to eager
+
         logits, kvs = self.forward(np.asarray(ids))
         out = []
         for _ in range(max_new_tokens):
@@ -462,5 +498,7 @@ class Model:
                 np.random.choice(len(last), p=np.exp((last - last.max()) / temperature)
                                  / np.exp((last - last.max()) / temperature).sum()))
             out.append(nxt)
+            if stop_ids and nxt in stop_ids:
+                break
             logits, kvs = self.forward(np.asarray([nxt]), kvs)
         return out

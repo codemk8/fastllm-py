@@ -45,12 +45,22 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float) -> int:
 
 
 class AsyncEngine:
-    def __init__(self, model: Model, cuda_graph: bool = True, graph_max_len: int = 8192):
+    def __init__(self, model: Model, cuda_graph: bool = True, graph_max_len: int = 8192,
+                 draft: Model | None = None, spec_gamma: int = 4):
         self.model = model
         self.requests: asyncio.Queue[GenRequest] = asyncio.Queue()
         self._task = None
         self.graph_max_len = graph_max_len
         self.gd = None  # lazily-captured GraphDecoder (single-stream decode)
+        # optional speculative decoding: a small draft proposes, target verifies.
+        # Used for greedy (temperature==0) requests only; output is identical to
+        # greedy target decoding. Needs a separate draft model sharing the vocab.
+        self.spec = None
+        if draft is not None:
+            from .speculative import SpeculativeDecoder
+
+            self.spec = SpeculativeDecoder(model, draft, gamma=spec_gamma,
+                                           draft_max_len=graph_max_len)
         if cuda_graph:
             try:
                 from .graph_decode import GraphDecoder, graph_capable
@@ -94,9 +104,26 @@ class AsyncEngine:
             ids = np.asarray(req.token_ids, dtype=np.int64)
             n_prompt = len(ids)
             produced = 0
-            use_graph = (self.gd is not None
+            # speculative path: greedy only (identical to greedy target decode)
+            use_spec = (self.spec is not None and req.temperature == 0.0
+                        and n_prompt + req.max_new_tokens < self.graph_max_len)
+            use_graph = (not use_spec and self.gd is not None
                          and n_prompt + req.max_new_tokens < self.graph_max_len)
-            if use_graph:
+            if use_spec:
+                t_prefill = None
+                state = {"n": 0}
+
+                def _on(tok):
+                    if state["n"] == 0:
+                        state["t_prefill"] = time.time() - t0
+                    state["n"] += 1
+                    emit(tok)
+
+                self.spec.generate(ids, max_new_tokens=req.max_new_tokens,
+                                   stop_ids=req.stop_token_ids, on_token=_on)
+                produced = state["n"]
+                t_prefill = state.get("t_prefill", time.time() - t0)
+            elif use_graph:
                 last, pos = self.gd.prime(ids)
                 t_prefill = time.time() - t0
                 while produced < req.max_new_tokens:
@@ -126,8 +153,14 @@ class AsyncEngine:
                 "completion_tokens": produced,
                 "prefill_s": round(t_prefill, 3),
                 "decode_tok_s": round(produced / dt, 2) if dt > 0 else None,
-                "decode_path": "cuda_graph" if use_graph else "eager",
+                "decode_path": ("speculative" if use_spec
+                                else "cuda_graph" if use_graph else "eager"),
             }
+            if use_spec:
+                s = self.spec.stats
+                acc = s["accepted"] / s["proposed"] if s["proposed"] else 0.0
+                req.stats["spec_accept"] = round(acc, 3)
+                req.stats["spec_target_forwards"] = s["target_forwards"]
         except Exception as e:  # keep the worker alive; report per-request
             import traceback
 

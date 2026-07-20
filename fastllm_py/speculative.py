@@ -54,9 +54,19 @@ class SpeculativeDecoder:
             except Exception:
                 self.draft_gd = None
 
-    def generate(self, prompt_ids, max_new_tokens: int = 128):
+    def generate(self, prompt_ids, max_new_tokens: int = 128, stop_ids=None,
+                 on_token=None):
+        """Greedy speculative decode (output identical to greedy target decode).
+        stop_ids: halt once one is emitted. on_token(tok): streaming callback,
+        called once per committed token in order (return value ignored)."""
         np_ = self._np
         ids = np.asarray(prompt_ids, dtype=np.int64)
+        stop = set(stop_ids) if stop_ids else None
+
+        def _emit(tok):
+            if on_token is not None:
+                on_token(tok)
+            return stop is not None and tok in stop
 
         t_log, t_kv = self.target.forward(ids)
         if self.draft_gd is not None:
@@ -69,6 +79,8 @@ class SpeculativeDecoder:
         out = [cur]
         self.stats = {"rounds": 0, "target_forwards": 1, "accepted": 0,
                       "proposed": 0}
+        if _emit(cur):
+            return out
 
         while len(out) < max_new_tokens:
             self.stats["rounds"] += 1
@@ -110,7 +122,6 @@ class SpeculativeDecoder:
                 emit = list(proposals)
                 keep = P + g                        # cur, t1..t_{g-1} in KV
                 cur = proposals[-1]                 # tg, forwarded next round
-            out.extend(emit)
             for c in t_kv:
                 c.truncate(keep)
             if self.draft_gd is not None:
@@ -119,5 +130,13 @@ class SpeculativeDecoder:
                 for c in d_kv:
                     c.truncate(keep)
             P = keep
+
+            # commit + stream the accepted tokens (respect the budget + stop)
+            for tok in emit:
+                if len(out) >= max_new_tokens:
+                    break
+                out.append(tok)
+                if _emit(tok):
+                    return out[:max_new_tokens]
 
         return out[:max_new_tokens]

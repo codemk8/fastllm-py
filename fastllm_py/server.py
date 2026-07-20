@@ -117,6 +117,11 @@ def main():
                         "needs --linear-quant int4)")
     p.add_argument("--max-batch", type=int, default=16,
                    help="max concurrent sequences for --continuous")
+    p.add_argument("--draft-model",
+                   help="small draft model dir for speculative decoding (must "
+                        "share the target's vocab; greedy requests only)")
+    p.add_argument("--spec-gamma", type=int, default=4,
+                   help="draft tokens proposed per speculative round")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -128,6 +133,15 @@ def main():
         gpu_cache_bytes=int(args.gpu_cache_gb * 2**30),
         linear_quant=args.linear_quant,
     )
+    draft_model = None
+    if args.draft_model:
+        draft_model = Model.load(
+            args.draft_model,
+            DeviceMap(json.loads(args.device)),
+            gpu_cache_bytes=int(args.gpu_cache_gb * 2**30),
+            linear_quant=args.linear_quant,
+        )
+
     stop_ids = [tok.eos_token_id] if tok.eos_token_id is not None else []
     extra = tok.convert_tokens_to_ids("<|im_end|>")
     if isinstance(extra, int) and extra >= 0 and extra not in stop_ids:
@@ -145,11 +159,13 @@ def main():
             print(f"[fastllm] decode path: continuous_batch "
                   f"(max_batch={args.max_batch})")
         else:
-            eng = AsyncEngine(model, cuda_graph=not args.no_cuda_graph)
+            eng = AsyncEngine(model, cuda_graph=not args.no_cuda_graph,
+                              draft=draft_model, spec_gamma=args.spec_gamma)
             STATE["engine"] = eng
             await eng.start()
-            print(f"[fastllm] decode path: "
-                  f"{'cuda_graph' if eng.gd is not None else 'eager'}")
+            path = ("speculative" if eng.spec is not None
+                    else "cuda_graph" if eng.gd is not None else "eager")
+            print(f"[fastllm] decode path: {path}")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

@@ -41,6 +41,13 @@ Speedup shrinks with width (bigger GEMMs are less dispatch-bound) but is a win
 everywhere. Attention is a flash-decode RawKernel (O(valid_len), not O(buffer)),
 so graph decode is robust at any context length. Detail: `benchmarks/GRAPH_RESULTS.md`.
 
+**On by default.** `Model.generate()` auto-routes greedy decode to a cached
+CUDA-graph decoder whenever the model is `graph_capable` (INT4 dense any GPU
+count, or resident-INT4 MoE on one GPU, non-MLA), and silently falls back to
+eager otherwise (sampling, fp16 weights, MLA, offloaded MoE, or a capture/verify
+failure). No flag needed — the low-level API and the server both take the fast
+path. Pass `use_graph=False` to force eager.
+
 ## Speculative decoding
 
 Greedy speculative decoding (`fastllm_py/speculative.py`) — a small draft
@@ -48,6 +55,16 @@ proposes γ tokens, the target verifies in one forward. Output is **identical to
 greedy target decoding**. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU:
 **2.03×** (γ=4, 68% draft acceptance; target forwards 96 → 30). The draft
 rollout runs on the graph decoder, so this composes with graph decode.
+
+Unlike graph decode, speculative can't be "on by default" — it needs a second
+draft model sharing the target's vocab, which is a model-selection/resource
+decision. Opt in at the server with `--draft-model <dir>` (greedy requests
+route through it and stream; sampling requests fall back to the normal path):
+
+```bash
+.venv/bin/python -m fastllm_py.server --model models/Qwen3-8B \
+    --linear-quant int4 --draft-model models/Qwen3-0.6B --spec-gamma 4
+```
 
 ## Batched decode (throughput / many concurrent streams)
 

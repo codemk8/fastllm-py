@@ -567,7 +567,7 @@ class GraphDecoder:
 
     # ------------------------------------------------------------- generate
     def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = True,
-                 verify: bool = True):
+                 verify: bool = True, stop_ids=None):
         if use_graph:
             self.resize(len(prompt_ids) + max_new_tokens)  # tight max_len (+capture)
         elif not self._captured:
@@ -579,8 +579,12 @@ class GraphDecoder:
             step = self.step_eager
             self.graph_fellback = True
         out = [int(np.argmax(first))]
+        if stop_ids and out[-1] in stop_ids:
+            return out
         for _ in range(max_new_tokens - 1):
             logits = step(out[-1], pos)
             pos += 1
             out.append(int(np.argmax(logits)))
+            if stop_ids and out[-1] in stop_ids:
+                break
         return out

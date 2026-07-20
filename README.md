@@ -25,16 +25,27 @@ concurrently.
 
 ## Measured performance
 
-Dev box (1× RTX 4090 used, 93 GB RAM, NFS storage), Qwen1.5-MoE-A2.7B
-single-stream decode, 8 GB GPU expert cache:
+Dev box: 2× RTX 4090 (24 GB), 93 GB RAM. Single-stream greedy decode.
+See `benchmarks/RESULTS.md` for the full auto-generated table.
 
-| Config | decode tok/s | expert cache hit |
-|---|---|---|
-| fp16 experts, hybrid CPU/GPU | 6.9 | 44% |
-| INT4 (Marlin) GPU experts | **14.6** | 80% |
+**Largest model on this host — deepseek-llm-67b-chat, INT4, split over both
+4090s: 12.9 tok/s decode** (21.4 + 18.2 GB VRAM; one-time 54 min quantize
+→ 32 GB on-disk cache, instant reload after). 236B+ MoE exceeds 93 GB RAM.
 
-Dense Qwen3-0.6B fp32: 30 tok/s (python-loop bound; CUDA graphs/paged
-attention are the next lever).
+Dense decode (fp32, one 4090), after the KV-cache / mask-skip / fused-kernel
+optimizations (~+17-30% over the first cut):
+
+| Model | decode tok/s |
+|---|---|
+| deepseek-coder-1.3b | 59.7 |
+| deepseek-llm-7b (fp16) | 36.6 |
+| R1-Distill-Qwen-1.5B | 46.0 |
+| Qwen3-0.6B | 43.1 |
+
+Next levers for single-stream decode: giving Marlin a controllable stream
+(unblocks CUDA-graph capture of the decode step), a fused MoE kernel to kill
+the per-expert Python dispatch + per-layer routing syncs, and FlashInfer
+paged attention (also unlocks continuous batching).
 
 ## Layout
 

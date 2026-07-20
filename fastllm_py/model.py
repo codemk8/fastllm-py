@@ -315,6 +315,12 @@ class Model:
             xp = xp_for(cur_dev)
             positions = xp.arange(past, past + x.shape[0])
 
+            # cross-layer prefetch: warm the next MoE layer's hot experts
+            # on the copy stream while this layer computes
+            nxt = layer.idx + 1
+            if nxt < len(self.layers) and self.layers[nxt].moe is not None:
+                self.layers[nxt].moe.prefetch_predicted()
+
             h = rmsnorm(x, layer.w["input_layernorm.weight"], cfg.norm_eps)
             x = x + self._attention(layer, h, positions, kv_caches[layer.idx])
             h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)

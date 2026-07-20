@@ -48,6 +48,8 @@ class MoELayer:
         import os
 
         self.pool = pool or ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
+        # exponentially-decayed expert activation frequency (for prefetch)
+        self.freq = np.zeros(cfg.num_experts, dtype=np.float64)
         # blocking stream: implicit ordering vs null-stream work (attention),
         # still overlaps with the cache's copy stream and CPU threads
         self.compute_stream = cp.cuda.Stream()
@@ -84,6 +86,19 @@ class MoELayer:
             np.add.at(out, idx, y.astype(np.float32))
         return out
 
+    def prefetch_predicted(self, top_n: int = 8):
+        """Prefetch this layer's historically hottest experts into the GPU
+        cache on the copy stream. Call while an earlier layer computes."""
+        if not self.freq.any():
+            return
+        if self.cache.used > 0.9 * self.cache.max_bytes:
+            return  # near-full: prefetch would evict (and eviction syncs)
+        for eid in np.argsort(-self.freq)[:top_n]:
+            eid = int(eid)
+            key = (self.layer_idx, eid)
+            if key not in self.cache:
+                self.cache.prefetch(key, lambda e=eid: self._materialize_cpu(e))
+
     # ---- forward --------------------------------------------------------
     def forward(self, x):
         """x: (T, hidden) on GPU. Returns (T, hidden) on GPU."""
@@ -102,6 +117,10 @@ class MoELayer:
             routed_scaling=cfg.routed_scaling_factor,
             e_score_bias=self.e_score_bias,
         )
+        self.freq *= 0.98
+        for t in tasks:
+            self.freq[t.expert_id] += len(t.token_idx)
+
         cpu_set, gpu_set = self.placement.split(
             tasks, self.estimator,
             gpu_cache_contains=lambda eid: (self.layer_idx, eid) in self.cache,

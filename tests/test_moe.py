@@ -99,6 +99,54 @@ def test_sigmoid_scoring_deepseek_style(weights):
          {e: "cpu" for e in range(E)}, threshold=4)
 
 
+def test_marlin_int4_gpu_experts(weights):
+    from fastllm_py.kernels import marlin
+
+    if not marlin.available():
+        pytest.skip("native marlin .so not built")
+    gate_w, experts, x = weights
+    # marlin needs dims %64: synthesize larger experts
+    rng = np.random.default_rng(7)
+    HID2, FF2 = 128, 256
+    experts2 = {
+        e: {p: (rng.standard_normal((FF2, HID2) if p != "down" else (HID2, FF2))
+                * 0.1).astype(np.float16)
+            for p in ("gate", "up", "down")}
+        for e in range(E)
+    }
+    gate_w2 = rng.standard_normal((E, HID2)).astype(np.float32) * 0.5
+    x2 = rng.standard_normal((T, HID2)).astype(np.float32)
+    cfg = make_cfg(hidden_dim=HID2, intermediate_dim=FF2)
+
+    from fastllm_py.moe import build_marlin_expert_payload
+
+    payloads = {e: build_marlin_expert_payload(experts2[e]) for e in range(E)}
+    layer = MoELayer(
+        cfg, 0, cp.asarray(gate_w2), experts2,
+        ExpertPlacement({e: "cuda:0" for e in range(E)}),
+        GpuExpertCache(1 << 28), SpeedEstimator(threshold=1),
+        gpu_payloads=payloads,
+    )
+    out = cp.asnumpy(layer.forward(cp.asarray(x2)))
+
+    # reference must use the DEQUANTIZED weights: this isolates the marlin
+    # plumbing from int4 quantization noise (which is ~13%/proj on gaussians)
+    def dequant(w, gs=128):
+        n, k = w.shape
+        g = w.astype(np.float32).reshape(n, k // gs, gs)
+        wmin, wmax = g.min(axis=2), g.max(axis=2)
+        scale = np.where(wmax - wmin == 0, 1.0, (wmax - wmin) / 15.0).astype(np.float32)
+        zero = np.clip(np.rint(-wmin / scale), 0, 15)
+        q = np.clip(np.rint(g / scale[:, :, None]) + zero[:, :, None], 0, 15)
+        return ((q - zero[:, :, None]) * scale[:, :, None]).reshape(n, k).astype(np.float16)
+
+    experts_dq = {e: {p: dequant(w) for p, w in ws.items()}
+                  for e, ws in experts2.items()}
+    ref = naive_moe(x2, gate_w2, experts_dq, cfg)
+    rel = np.abs(out - ref).mean() / (np.abs(ref).mean() + 1e-9)
+    assert rel < 0.02, rel
+
+
 def test_route_topk_task_lists():
     rng = np.random.default_rng(0)
     scores = rng.standard_normal((5, E)).astype(np.float32)

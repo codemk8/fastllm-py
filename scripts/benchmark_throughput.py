@@ -30,6 +30,8 @@ def main():
     p.add_argument("--gpu-cache-gb", type=float, default=8.0)
     p.add_argument("--calibrate", action="store_true",
                    help="calibrate CPU/GPU expert split threshold first")
+    p.add_argument("--gpu-expert-quant", default="none", choices=["none", "int4"],
+                   help="quantize GPU-side experts (marlin int4)")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -39,7 +41,8 @@ def main():
     model = Model.load(args.model, DeviceMap(json.loads(args.device)),
                        moe_device=MoeDeviceMap(json.loads(args.moe_device)),
                        expert_dtype=args.expert_dtype,
-                       gpu_cache_bytes=int(args.gpu_cache_gb * 2**30))
+                       gpu_cache_bytes=int(args.gpu_cache_gb * 2**30),
+                       gpu_expert_quant=args.gpu_expert_quant)
     print(f"load: {time.time()-t0:.1f}s")
 
     if args.calibrate:

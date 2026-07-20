@@ -26,11 +26,59 @@ def _expert_ffn(x, w, xp):
     return swiglu(g, u) @ w["down"].T
 
 
+# ---------------------------------------------------------------- marlin int4
+def build_marlin_expert_payload(w_fp16: dict, group_size: int = 128) -> dict:
+    """Quantize one expert's {gate,up,down} to Marlin INT4 format.
+
+    Returns a flat dict of numpy arrays ("<proj>.qweight/.scales/.zeros")
+    ready for direct upload — repack and permutation are done here once
+    (device repack, result downloaded), so runtime upload is a plain memcpy
+    at ~1/4 the fp16 size.
+    """
+    import cupy as cp
+
+    from .kernels import marlin
+
+    payload = {}
+    for proj, w in w_fp16.items():
+        size_n, size_k = w.shape
+        g = w.astype(np.float32).reshape(size_n, size_k // group_size, group_size)
+        wmin, wmax = g.min(axis=2), g.max(axis=2)
+        scale = (wmax - wmin) / 15.0
+        scale = np.where(scale == 0, 1.0, scale).astype(np.float32)
+        zero = np.clip(np.rint(-wmin / scale), 0, 15).astype(np.int64)
+        q = np.clip(np.rint(g / scale[:, :, None]) + zero[:, :, None], 0, 15
+                    ).astype(np.uint8).reshape(size_n, size_k)
+        packed = marlin.pack_gptq_qweight(q)
+        repacked = cp.asnumpy(marlin.marlin_repack(cp.asarray(packed), size_k, size_n))
+        scales, zeros = marlin.build_marlin_scales_zeros(scale, zero, group_size)
+        payload[f"{proj}.qweight"] = repacked
+        payload[f"{proj}.scales"] = scales
+        payload[f"{proj}.zeros"] = zeros
+    return payload
+
+
+def _expert_ffn_marlin(x_fp16, w, workspaces):
+    """Marlin INT4 expert ffn. w: uploaded payload dict (GPU arrays)."""
+    from .kernels import marlin
+
+    def mm(proj, inp):
+        size_n = w[f"{proj}.scales"].shape[1]
+        return marlin.marlin_gemm_int4(
+            inp, w[f"{proj}.qweight"], w[f"{proj}.scales"], w[f"{proj}.zeros"],
+            workspaces[size_n], size_n=size_n)
+
+    g = mm("gate", x_fp16)
+    u = mm("up", x_fp16)
+    return mm("down", swiglu(g, u))
+
+
 class MoELayer:
     def __init__(self, cfg, layer_idx: int, gate_weight, expert_weights_cpu,
                  placement: ExpertPlacement, cache: GpuExpertCache,
                  estimator: SpeedEstimator, shared_weights=None, shared_gate=None,
-                 gate_bias=None, e_score_bias=None, pool: ThreadPoolExecutor | None = None):
+                 gate_bias=None, e_score_bias=None, pool: ThreadPoolExecutor | None = None,
+                 gpu_payloads: dict | None = None):
         import cupy as cp
 
         self.cp = cp
@@ -40,6 +88,8 @@ class MoELayer:
         self.gate_bias = gate_bias
         self.e_score_bias = e_score_bias        # DeepSeek V3 e_score_correction_bias
         self.experts_cpu = expert_weights_cpu   # eid -> {gate,up,down} np arrays or callable
+        self.gpu_payloads = gpu_payloads        # eid -> marlin int4 payload (or None=fp16)
+        self._workspaces: dict[int, object] = {}
         self.placement = placement
         self.cache = cache
         self.estimator = estimator
@@ -57,7 +107,16 @@ class MoELayer:
     # ---- device-side helpers -------------------------------------------
     def _gpu_expert_weights(self, eid: int):
         key = (self.layer_idx, eid)
+        if self.gpu_payloads is not None:
+            return self.cache.get_or_upload(key, lambda: self.gpu_payloads[eid])
         return self.cache.get_or_upload(key, lambda: self._materialize_cpu(eid))
+
+    def _workspace(self, size_n: int):
+        if size_n not in self._workspaces:
+            from .kernels import marlin
+
+            self._workspaces[size_n] = marlin.make_workspace(size_n, self.cp)
+        return self._workspaces[size_n]
 
     def _materialize_cpu(self, eid: int):
         w = self.experts_cpu[eid]
@@ -65,12 +124,19 @@ class MoELayer:
 
     def _run_gpu_experts(self, x_gpu, tasks: list[ExpertTask], out_gpu):
         cp = self.cp
+        marlin_mode = self.gpu_payloads is not None
         with self.compute_stream:
+            x16 = x_gpu.astype(cp.float16) if marlin_mode else None
             for t in tasks:
                 w = self._gpu_expert_weights(t.expert_id)
                 idx = cp.asarray(t.token_idx)
                 wgt = cp.asarray(t.weights)[:, None]
-                y = _expert_ffn(x_gpu[idx], w, cp) * wgt
+                if marlin_mode:
+                    ws = {s.shape[1]: self._workspace(s.shape[1])
+                          for k, s in w.items() if k.endswith(".scales")}
+                    y = _expert_ffn_marlin(x16[idx], w, ws).astype(cp.float32) * wgt
+                else:
+                    y = _expert_ffn(x_gpu[idx], w, cp) * wgt
                 # scatter-add (indices within one expert are unique)
                 cp.add.at(out_gpu, idx, y.astype(out_gpu.dtype))
 

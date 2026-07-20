@@ -83,7 +83,8 @@ class Model:
     @classmethod
     def load(cls, model_path: str, device_map: DeviceMap | None = None,
              dtype: str = "float32", moe_device: "MoeDeviceMap | None" = None,
-             expert_dtype: str = "float16", gpu_cache_bytes: int = 8 << 30) -> "Model":
+             expert_dtype: str = "float16", gpu_cache_bytes: int = 8 << 30,
+             gpu_expert_quant: str = "none") -> "Model":
         from .config import load_config
 
         cfg = load_config(model_path)
@@ -125,7 +126,7 @@ class Model:
             m.layers.append(layer)
             if is_moe:
                 m._attach_moe(layer, base, store, up, moe_device, expert_dtype,
-                              gpu_cache_bytes)
+                              gpu_cache_bytes, gpu_expert_quant)
 
         m.head_device = last_dev
         m.final_norm = up(f"{prefix}norm.weight", last_dev)
@@ -137,7 +138,8 @@ class Model:
         return m
 
     def _attach_moe(self, layer: DecoderLayer, base: str, store: WeightStore,
-                    up, moe_device, expert_dtype: str, gpu_cache_bytes: int):
+                    up, moe_device, expert_dtype: str, gpu_cache_bytes: int,
+                    gpu_expert_quant: str = "none"):
         """Build a MoELayer for this decoder layer from checkpoint names."""
         import numpy as np
 
@@ -173,6 +175,13 @@ class Model:
         for e in range(eid):
             placement[e] = moe_device.expert_device(e, eid)
 
+        gpu_payloads = None
+        if gpu_expert_quant == "int4":
+            from .moe import build_marlin_expert_payload
+
+            gpu_payloads = {e: build_marlin_expert_payload(experts[e])
+                            for e in range(eid)}
+
         shared = shared_gate = None
         for sname in ("mlp.shared_expert.", "mlp.shared_experts."):
             if base + sname + "gate_proj.weight" in store:
@@ -187,7 +196,7 @@ class Model:
             ExpertPlacement(placement), self._moe_shared["cache"],
             self._moe_shared["estimator"], shared_weights=shared,
             shared_gate=shared_gate, gate_bias=gate_bias, e_score_bias=e_bias,
-            pool=self._moe_shared["pool"],
+            pool=self._moe_shared["pool"], gpu_payloads=gpu_payloads,
         )
         if self._moe_shared["pool"] is None:
             self._moe_shared["pool"] = layer.moe.pool

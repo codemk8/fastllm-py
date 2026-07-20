@@ -23,7 +23,7 @@ def main():
     from fastllm_py import DeviceMap, Model
     from fastllm_py.device_router import MoeDeviceMap
 
-    tok = AutoTokenizer.from_pretrained(cfg["path"])
+    tok = AutoTokenizer.from_pretrained(cfg["path"], trust_remote_code=True)
     # deterministic synthetic prompt of the requested length
     base = tok("The quick brown fox jumps over the lazy dog. ").input_ids
     n_prefill = cfg.get("prefill_tokens", 128)
@@ -46,6 +46,15 @@ def main():
     logits, kvs = model.forward(ids)
     cp.cuda.Device().synchronize()
     prefill_s = time.time() - t0
+
+    # drain pool high-water marks left by prefill: per-stream arenas
+    # (default/compute/copy) each retain their peak, which can pin the
+    # pool near the VRAM ceiling and make decode allocations thrash
+    logits_host = cp.asnumpy(logits)
+    del logits
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    logits = cp.asarray(logits_host)
 
     # decode
     nxt = int(cp.asnumpy(logits[-1]).argmax())

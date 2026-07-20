@@ -21,6 +21,7 @@ class GpuExpertCache:
         self.cache: dict = {}
         self.events: dict = {}  # key -> upload-complete event
         self.lru: collections.OrderedDict = collections.OrderedDict()
+        self._graveyard: list = []  # (value, [events]) awaiting last GPU use
         self.hits = 0
         self.misses = 0
         # dedicated copy stream so uploads overlap compute. Blocking
@@ -39,17 +40,31 @@ class GpuExpertCache:
             return sum(v.nbytes for v in value.values())
         return value.nbytes
 
+    def _sweep_graveyard(self):
+        still = []
+        for value, evs in self._graveyard:
+            if all(ev.done for ev in evs):
+                continue  # last enqueued use finished; drop -> block returns to pool
+            still.append((value, evs))
+        self._graveyard = still
+
     def _evict_until(self, needed: int):
-        evicted = False
+        """Deferred eviction: victims are parked with events recorded on the
+        streams that may still touch them, and only released once those
+        events complete — no device-wide synchronize on the decode path."""
+        cp = self.cp
+        self._sweep_graveyard()
         while self.used + needed > self.max_bytes and self.lru:
-            if not evicted:
-                # freed blocks may be reused by later uploads: make sure no
-                # in-flight kernel still reads them (eviction is rare)
-                self.cp.cuda.Device(self.device).synchronize()
-                evicted = True
             victim, _ = self.lru.popitem(last=False)
-            self.used -= self._nbytes(self.cache.pop(victim))
+            value = self.cache.pop(victim)
+            self.used -= self._nbytes(value)
             self.events.pop(victim, None)
+            evs = []
+            for stream in (cp.cuda.get_current_stream(), self.copy_stream):
+                ev = cp.cuda.Event()
+                ev.record(stream)
+                evs.append(ev)
+            self._graveyard.append((value, evs))
 
     def _upload_one(self, arr, stream):
         cp = self.cp

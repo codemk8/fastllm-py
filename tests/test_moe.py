@@ -147,6 +147,24 @@ def test_marlin_int4_gpu_experts(weights):
     assert rel < 0.02, rel
 
 
+def test_eviction_under_pressure(weights):
+    """Cache sized for ~2 experts: every forward evicts. Deferred eviction
+    must stay correct with no device-wide syncs."""
+    gate_w, experts, x = weights
+    per_expert = sum(v.nbytes for v in experts[0].values())
+    cache = GpuExpertCache(int(per_expert * 2.5))
+    layer = MoELayer(
+        make_cfg(), 0, cp.asarray(gate_w), experts,
+        ExpertPlacement({e: "cuda:0" for e in range(E)}), cache,
+        SpeedEstimator(threshold=1),
+    )
+    ref = naive_moe(x, gate_w, experts, make_cfg())
+    for _ in range(6):
+        out = cp.asnumpy(layer.forward(cp.asarray(x)))
+        np.testing.assert_allclose(out, ref, rtol=2e-3, atol=2e-3)
+    assert cache.misses > cache.hits  # eviction actually happened
+
+
 def test_route_topk_task_lists():
     rng = np.random.default_rng(0)
     scores = rng.standard_normal((5, E)).astype(np.float32)

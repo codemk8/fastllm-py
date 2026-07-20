@@ -36,6 +36,8 @@ def test_fused_moe_matches_reference(E, K, hidden, inter, gs):
     stacked = moe_int4.build_stacked_experts(experts, gs, xp=cp)
     y = cp.asnumpy(moe_int4.fused_moe_ffn(cp.asarray(x), stacked,
                                           cp.asarray(eidx), cp.asarray(rw), hidden, inter))
+    y2 = cp.asnumpy(moe_int4.fused_moe_ffn2(cp.asarray(x), stacked,
+                                            cp.asarray(eidx), cp.asarray(rw), hidden, inter))
 
     # reference: dequant the SAME row-major payloads, run each expert's FFN
     ref = np.zeros(hidden, dtype=np.float32)
@@ -49,6 +51,7 @@ def test_fused_moe_matches_reference(E, K, hidden, inter, gs):
         act = (g / (1 + np.exp(-g))) * u
         ref += float(rw[k]) * (act @ wq["down"].T)
     np.testing.assert_allclose(y, ref, rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(y2, ref, rtol=2e-3, atol=2e-3)
 
 
 def test_gemv_close_to_marlin():

@@ -112,6 +112,108 @@ def build_stacked_experts(expert_ws, group_size: int = 128, xp=np) -> dict:
     return out
 
 
+_FUSED2 = None
+
+
+def _fused2_kernels(cp):
+    """Two-kernel fused MoE with proper parallelism: one block per (expert,
+    output-row), threads cooperate over the input dim (block reduction). K1
+    computes swiglu(gate,up) -> intermediate[K,inter]; K2 does down + weighted
+    atomic-accumulate. Far more blocks than the one-block-per-expert version, so
+    the GPU isn't idle."""
+    global _FUSED2
+    if _FUSED2 is None:
+        src = r"""
+        #include <cuda_fp16.h>
+        __device__ __forceinline__ float row_dot(
+                const unsigned char* qw, const __half* sc, const __half* ze,
+                int row, const float* vec, int in_f, int gs, int tid, int nt) {
+            const unsigned char* wr = qw + (long long)row * (in_f / 2);
+            const __half* s = sc + (long long)row * (in_f / gs);
+            const __half* z = ze + (long long)row * (in_f / gs);
+            float acc = 0.0f;
+            for (int i = tid * 2; i < in_f; i += nt * 2) {   // 2 nibbles/byte/thread
+                int gi = i / gs;
+                float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
+                unsigned char b = wr[i / 2];
+                acc += ((float)(b & 0xF) - zv) * sv * vec[i];
+                acc += ((float)(b >> 4) - zv) * sv * vec[i + 1];
+            }
+            return acc;
+        }
+        __device__ __forceinline__ float blk_reduce(float v, float* sh, int tid, int nt) {
+            sh[tid] = v; __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) {
+                if (tid < s) sh[tid] += sh[tid + s];
+                __syncthreads();
+            }
+            return sh[0];
+        }
+        extern "C" __global__ void moe_gate_up(
+                const float* __restrict__ x,
+                const unsigned char* gqw, const __half* gsc, const __half* gze,
+                const unsigned char* uqw, const __half* usc, const __half* uze,
+                const int* __restrict__ eidx, float* __restrict__ inter,
+                int hidden, int ninter, int gs) {
+            int k = blockIdx.y, r = blockIdx.x;   // expert slot, inter row
+            int e = eidx[k], tid = threadIdx.x, nt = blockDim.x;
+            long long qb = (long long)e * ninter * (hidden / 2);
+            long long sb = (long long)e * ninter * (hidden / gs);
+            extern __shared__ float sh[];
+            float gp = row_dot(gqw + qb, gsc + sb, gze + sb, r, x, hidden, gs, tid, nt);
+            float g = blk_reduce(gp, sh, tid, nt);
+            __syncthreads();
+            float up = row_dot(uqw + qb, usc + sb, uze + sb, r, x, hidden, gs, tid, nt);
+            float u = blk_reduce(up, sh, tid, nt);
+            if (tid == 0) inter[(long long)k * ninter + r] = (g / (1.0f + __expf(-g))) * u;
+        }
+        extern "C" __global__ void moe_down(
+                const float* __restrict__ inter,
+                const unsigned char* dqw, const __half* dsc, const __half* dze,
+                const int* __restrict__ eidx, const float* __restrict__ rw,
+                float* __restrict__ out, int hidden, int ninter, int gs) {
+            int k = blockIdx.y, o = blockIdx.x;   // expert slot, hidden row
+            int e = eidx[k], tid = threadIdx.x, nt = blockDim.x;
+            long long qb = (long long)e * hidden * (ninter / 2);
+            long long sb = (long long)e * hidden * (ninter / gs);
+            const float* iv = inter + (long long)k * ninter;
+            extern __shared__ float sh[];
+            float dp = row_dot(dqw + qb, dsc + sb, dze + sb, o, iv, ninter, gs, tid, nt);
+            float d = blk_reduce(dp, sh, tid, nt);
+            if (tid == 0) atomicAdd(&out[o], rw[k] * d);
+        }
+        """
+        _FUSED2 = (cp.RawKernel(src, "moe_gate_up"), cp.RawKernel(src, "moe_down"))
+    return _FUSED2
+
+
+def fused_moe_ffn2(x, stacked, eidx, rw, hidden, inter, out=None, inter_buf=None,
+                   threads=128):
+    """Efficient two-kernel selective MoE FFN (see _fused2_kernels)."""
+    import cupy as cp
+
+    gu, dn = _fused2_kernels(cp)
+    gs = stacked["group"]
+    K = int(eidx.shape[0])
+    x = cp.ascontiguousarray(x.astype(cp.float32).ravel())
+    eidx = eidx.astype(cp.int32)
+    rw = rw.astype(cp.float32)
+    ibuf = inter_buf if inter_buf is not None else cp.empty((K, inter), dtype=cp.float32)
+    y = out if out is not None else cp.zeros((hidden,), dtype=cp.float32)
+    if out is not None:
+        y.fill(0)
+    gu((inter, K), (threads,),
+       (x, stacked["gate.qweight"], stacked["gate.scales"], stacked["gate.zeros"],
+        stacked["up.qweight"], stacked["up.scales"], stacked["up.zeros"],
+        eidx, ibuf, np.int32(hidden), np.int32(inter), np.int32(gs)),
+       shared_mem=threads * 4)
+    dn((hidden, K), (threads,),
+       (ibuf, stacked["down.qweight"], stacked["down.scales"], stacked["down.zeros"],
+        eidx, rw, y, np.int32(hidden), np.int32(inter), np.int32(gs)),
+       shared_mem=threads * 4)
+    return y
+
+
 _FUSED = None
 
 

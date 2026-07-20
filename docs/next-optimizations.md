@@ -23,15 +23,17 @@ stream=)` routes to it (bit-identical to the default, tested); INT4 MoE
 experts now run on `compute_stream` instead of stream 0. This unblocks graph
 capture and removes the barrier vs the blocking compute stream.
 
-**TODO: CUDA-graph the decode step.** Capture the T=1 forward once and replay
-(~1 launch instead of ~500-800). Requires static addresses + shapes:
-- KV cache is already a stable capacity-doubling buffer (`KVCache`); the only
-  varying shape is attention over S keys. Options: (a) capture per KV-length
-  bucket and re-capture on growth past a power-of-2, or (b) pad K/V to a fixed
-  max and mask — pick per measurement.
-- Preallocate all decode scratch; no `cp.asnumpy`/host branches inside capture
-  (the MoE routing D2H sync must move out — see #2).
-Expect the largest single jump here, especially for the INT4 / 67B path.
+**DONE: CUDA-graph the decode step** (`fastllm_py/graph_decode.py`). Captures
+the whole T=1 INT4-dense step and replays it as one launch. **~4.2-4.9x decode
+speedup**, bit-exact vs eager (Qwen3-0.6B 43->213, coder-1.3b 60->277,
+R1-1.5B 49->205 tok/s). Design: pad K/V to `max_len` with a bias mask (static
+shapes); Marlin linears on the capture stream; attention as broadcast-multiply
++ reductions (cuBLAS is rejected during cupy capture); lm_head runs outside the
+graph; new K/V written by a RawKernel at a device-resident position; dedicated
+capture mem-pool + per-call Marlin workspaces; all input writes on the capture
+stream (a default-stream write race was the long-hunted correctness bug).
+Remaining: single-GPU + non-MLA only (67B is 2-GPU; MLA/MoE need the routing
+D2H sync moved on-device — see #2).
 
 ## 2. Fused MoE kernel (kills per-expert dispatch + routing syncs)
 

@@ -112,6 +112,131 @@ def build_stacked_experts(expert_ws, group_size: int = 128, xp=np) -> dict:
     return out
 
 
+_GATE = None
+
+
+def _gate_kernel(cp):
+    """Capturable fp16 gate matvec: logits[e] = dot(x, gate_w[e]). One block per
+    expert, threads over hidden + block reduction. Replaces the cuBLAS matmul
+    (which can't run during CUDA-graph capture)."""
+    global _GATE
+    if _GATE is None:
+        _GATE = cp.RawKernel(r"""
+        #include <cuda_fp16.h>
+        extern "C" __global__ void gate_matvec(
+                const float* __restrict__ x, const __half* __restrict__ gw,
+                float* __restrict__ logits, int hidden) {
+            int e = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+            const __half* w = gw + (long long)e * hidden;
+            float acc = 0.0f;
+            for (int i = tid; i < hidden; i += nt) acc += __half2float(w[i]) * x[i];
+            extern __shared__ float sh[];
+            sh[tid] = acc; __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid+s]; __syncthreads(); }
+            if (tid == 0) logits[e] = sh[0];
+        }""", "gate_matvec")
+    return _GATE
+
+
+def gate_matvec(x, gate_w, E, hidden, out=None, threads=128):
+    """logits (E,) = x(hidden,) @ gate_w(E,hidden).T, capturable (no cuBLAS)."""
+    import cupy as cp
+    k = _gate_kernel(cp)
+    x = cp.ascontiguousarray(x.astype(cp.float32).ravel())
+    y = out if out is not None else cp.empty((E,), dtype=cp.float32)
+    k((E,), (threads,), (x, gate_w, y, np.int32(hidden)), shared_mem=threads * 4)
+    return y
+
+
+_FUSEDW = None
+
+
+def _fusedw_kernels(cp):
+    """Like _fused2 but driven by an (E,) routing-WEIGHT vector instead of K
+    indices: grid over ALL E experts, each block early-outs if its weight is 0.
+    Fully capturable (fixed grid, no index extraction / D2H) and still selective
+    — non-routed experts read nothing past the weight check."""
+    global _FUSEDW
+    if _FUSEDW is None:
+        src = r"""
+        #include <cuda_fp16.h>
+        __device__ __forceinline__ float row_dot(
+                const unsigned char* qw, const __half* sc, const __half* ze,
+                int row, const float* vec, int in_f, int gs, int tid, int nt) {
+            const unsigned char* wr = qw + (long long)row * (in_f / 2);
+            const __half* s = sc + (long long)row * (in_f / gs);
+            const __half* z = ze + (long long)row * (in_f / gs);
+            float acc = 0.0f;
+            for (int i = tid * 2; i < in_f; i += nt * 2) {
+                int gi = i / gs; float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
+                unsigned char b = wr[i / 2];
+                acc += ((float)(b & 0xF) - zv) * sv * vec[i];
+                acc += ((float)(b >> 4) - zv) * sv * vec[i + 1];
+            }
+            return acc;
+        }
+        __device__ __forceinline__ float blk_reduce(float v, float* sh, int tid, int nt) {
+            sh[tid] = v; __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid+s]; __syncthreads(); }
+            return sh[0];
+        }
+        extern "C" __global__ void moew_gate_up(
+                const float* __restrict__ x, const float* __restrict__ rw,
+                const unsigned char* gqw, const __half* gsc, const __half* gze,
+                const unsigned char* uqw, const __half* usc, const __half* uze,
+                float* __restrict__ inter, int hidden, int ninter, int gs) {
+            int e = blockIdx.y, r = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+            if (rw[e] == 0.0f) return;                       // non-routed: skip
+            long long qb = (long long)e * ninter * (hidden / 2);
+            long long sb = (long long)e * ninter * (hidden / gs);
+            extern __shared__ float sh[];
+            float g = blk_reduce(row_dot(gqw+qb, gsc+sb, gze+sb, r, x, hidden, gs, tid, nt), sh, tid, nt);
+            __syncthreads();
+            float u = blk_reduce(row_dot(uqw+qb, usc+sb, uze+sb, r, x, hidden, gs, tid, nt), sh, tid, nt);
+            if (tid == 0) inter[(long long)e * ninter + r] = (g / (1.0f + __expf(-g))) * u;
+        }
+        extern "C" __global__ void moew_down(
+                const float* __restrict__ inter, const float* __restrict__ rw,
+                const unsigned char* dqw, const __half* dsc, const __half* dze,
+                float* __restrict__ out, int hidden, int ninter, int gs) {
+            int e = blockIdx.y, o = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+            float w = rw[e];
+            if (w == 0.0f) return;
+            long long qb = (long long)e * hidden * (ninter / 2);
+            long long sb = (long long)e * hidden * (ninter / gs);
+            const float* iv = inter + (long long)e * ninter;
+            extern __shared__ float sh[];
+            float d = blk_reduce(row_dot(dqw+qb, dsc+sb, dze+sb, o, iv, ninter, gs, tid, nt), sh, tid, nt);
+            if (tid == 0) atomicAdd(&out[o], w * d);
+        }
+        """
+        _FUSEDW = (cp.RawKernel(src, "moew_gate_up"), cp.RawKernel(src, "moew_down"))
+    return _FUSEDW
+
+
+def fused_moe_weighted(x, stacked, rw, E, hidden, inter, out=None, inter_buf=None,
+                       threads=128):
+    """Capturable selective MoE FFN driven by an (E,) routing-weight vector.
+    inter_buf must be (E, inter). Only rw[e]>0 experts contribute."""
+    import cupy as cp
+    gu, dn = _fusedw_kernels(cp)
+    gs = stacked["group"]
+    x = cp.ascontiguousarray(x.astype(cp.float32).ravel())
+    rw = cp.ascontiguousarray(rw.astype(cp.float32).ravel())
+    ibuf = inter_buf if inter_buf is not None else cp.empty((E, inter), dtype=cp.float32)
+    y = out if out is not None else cp.zeros((hidden,), dtype=cp.float32)
+    if out is not None:
+        y.fill(0)
+    gu((inter, E), (threads,),
+       (x, rw, stacked["gate.qweight"], stacked["gate.scales"], stacked["gate.zeros"],
+        stacked["up.qweight"], stacked["up.scales"], stacked["up.zeros"],
+        ibuf, np.int32(hidden), np.int32(inter), np.int32(gs)), shared_mem=threads * 4)
+    dn((hidden, E), (threads,),
+       (ibuf, rw, stacked["down.qweight"], stacked["down.scales"], stacked["down.zeros"],
+        y, np.int32(hidden), np.int32(inter), np.int32(gs)), shared_mem=threads * 4)
+    return y
+
+
 _FUSED2 = None
 
 

@@ -54,6 +54,72 @@ def test_fused_moe_matches_reference(E, K, hidden, inter, gs):
     np.testing.assert_allclose(y2, ref, rtol=2e-3, atol=2e-3)
 
 
+def test_gate_matvec_matches_cublas():
+    rng = np.random.default_rng(3)
+    E, hidden = 60, 2048
+    gw = (rng.standard_normal((E, hidden)) * 0.1).astype(np.float16)
+    x = (rng.standard_normal(hidden) * 0.3).astype(np.float32)
+    y = cp.asnumpy(moe_int4.gate_matvec(cp.asarray(x), cp.asarray(gw), E, hidden))
+    ref = x @ gw.astype(np.float32).T
+    np.testing.assert_allclose(y, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_fused_moe_weighted_matches_index_version():
+    rng = np.random.default_rng(4)
+    E, K, hidden, inter, gs = 60, 4, 512, 1408, 128
+    experts = [{"gate": (rng.standard_normal((inter, hidden)) * 0.1).astype(np.float16),
+                "up": (rng.standard_normal((inter, hidden)) * 0.1).astype(np.float16),
+                "down": (rng.standard_normal((hidden, inter)) * 0.1).astype(np.float16)}
+               for _ in range(E)]
+    stacked = moe_int4.build_stacked_experts(experts, gs, xp=cp)
+    x = (rng.standard_normal(hidden) * 0.3).astype(np.float32)
+    eidx = rng.choice(E, K, replace=False).astype(np.int32)
+    w = (rng.random(K) + 0.1).astype(np.float32)
+    rw = np.zeros(E, dtype=np.float32)
+    rw[eidx] = w
+    yw = cp.asnumpy(moe_int4.fused_moe_weighted(cp.asarray(x), stacked, cp.asarray(rw),
+                                                E, hidden, inter))
+    yi = cp.asnumpy(moe_int4.fused_moe_ffn2(cp.asarray(x), stacked, cp.asarray(eidx),
+                                            cp.asarray(w), hidden, inter))
+    # same math; accumulation order over experts differs (atomicAdd) -> ~fp noise
+    np.testing.assert_allclose(yw, yi, rtol=1e-4, atol=1e-5)
+
+
+def test_fused_moe_weighted_captures():
+    """gate + route + weighted fused kernel must be CUDA-graph-capturable."""
+    rng = np.random.default_rng(5)
+    E, K, hidden, inter, gs = 60, 4, 512, 512, 128
+    experts = [{"gate": (rng.standard_normal((inter, hidden)) * 0.1).astype(np.float16),
+                "up": (rng.standard_normal((inter, hidden)) * 0.1).astype(np.float16),
+                "down": (rng.standard_normal((hidden, inter)) * 0.1).astype(np.float16)}
+               for _ in range(E)]
+    stacked = moe_int4.build_stacked_experts(experts, gs, xp=cp)
+    gw = cp.asarray((rng.standard_normal((E, hidden)) * 0.1).astype(np.float16))
+    # non-degenerate x so routing isn't an all-tied threshold
+    x = cp.asarray((rng.standard_normal(hidden) * 0.5).astype(np.float32))
+    lbuf = cp.empty(E, dtype=cp.float32); ibuf = cp.empty((E, inter), dtype=cp.float32)
+    rw = cp.empty(E, dtype=cp.float32); out = cp.zeros(hidden, dtype=cp.float32)
+    stream = cp.cuda.Stream(non_blocking=True)
+
+    def step():
+        moe_int4.gate_matvec(x, gw, E, hidden, out=lbuf)
+        e = cp.exp(lbuf - lbuf.max()); probs = e / e.sum()
+        kth = cp.sort(probs)[-K]; rw[:] = cp.where(probs >= kth, probs, 0.0)
+        out.fill(0)
+        moe_int4.fused_moe_weighted(x, stacked, rw, E, hidden, inter, out=out, inter_buf=ibuf)
+
+    with stream:
+        for _ in range(3):
+            step()
+    stream.synchronize()
+    with stream:
+        stream.begin_capture()
+        step()
+    graph = stream.end_capture()
+    graph.launch(stream); stream.synchronize()
+    assert int((cp.asnumpy(rw) > 0).sum()) == K
+
+
 def test_gemv_close_to_marlin():
     """Row-major and marlin use the same RTN quant, so their GEMV outputs should
     agree to int4 rounding (both dequantize the same q/scale/zero)."""

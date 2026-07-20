@@ -12,10 +12,11 @@ N=1 GPU is just the single-segment case. Per token this is N graph launches +
 
 Design invariants (per segment):
   * one capturable (non-blocking) stream on the segment's device;
-  * static shapes — KV is preallocated to ``max_len`` and attention runs over
-    the *full* buffer with an additive bias mask (unwritten slots are zeroed
-    and masked to -inf);
-  * static addresses — fixed input/pos/bias/output buffers updated in place;
+  * static shapes — KV is preallocated to ``max_len``; attention is a
+    flash-decode RawKernel that loops only over the valid ``[0, pos]`` keys
+    (``valid_len = pos+1`` read from the device pos buffer), so its cost is
+    O(valid_len), not O(max_len);
+  * static addresses — fixed input/pos/output buffers updated in place;
   * no host sync inside the step — the new K/V row is written by a RawKernel at
     a device-resident position; RoPE is a gather from a precomputed table.
 
@@ -199,7 +200,6 @@ class _Segment:
         self.graph = None          # invalidate any prior capture
         self.ws_list, self.ws_i = [], 0
         with cp.cuda.Device(self.dev_id):
-            self.bias = cp.full((max_len,), -1e30, dtype=cp.float32)
             self.k_cache = [cp.zeros((max_len, KVH, D), dtype=dt) for _ in self.layers]
             self.v_cache = [cp.zeros((max_len, KVH, D), dtype=dt) for _ in self.layers]
             cos, sin = self._decoder.model._rope_cache(cp.arange(max_len), D, cp)
@@ -261,7 +261,7 @@ class GraphDecoder:
 
     def _segment_step(self, seg):
         """Issue this segment's layers on seg.stream, reading seg.x_in /
-        pos_idx / bias and writing seg.hidden_out. Static shapes, no host sync."""
+        pos_idx and writing seg.hidden_out. Static shapes, no host sync."""
         cp = self.cp
         cfg = self.cfg
         H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
@@ -330,12 +330,10 @@ class GraphDecoder:
             raise ValueError(f"prompt {n} exceeds max_len {self.max_len}")
         for seg in self.segments:
             with cp.cuda.Device(seg.dev_id):
-                seg.bias.fill(-1e30)   # reset mask (reused decoder / new request)
                 for li in range(len(seg.layers)):
                     gi = seg.layer_offset + li
                     seg.k_cache[li][:n] = kvs[gi].k.astype(self.dtype)
                     seg.v_cache[li][:n] = kvs[gi].v.astype(self.dtype)
-                seg.bias[:n] = 0.0
         last = logits[-1]
         return (cp.asnumpy(last) if isinstance(last, cp.ndarray) else last), n
 
@@ -365,7 +363,6 @@ class GraphDecoder:
                     c.fill(0)
                 for c in seg.v_cache:
                     c.fill(0)
-                seg.bias.fill(-1e30)
                 seg.stream.synchronize()
         self._captured = True
 
@@ -413,7 +410,6 @@ class GraphDecoder:
                         prev.hidden_out.data.ptr, prev.dev_id,
                         nbytes, seg.stream.ptr)
                 seg.pos_idx[0] = position
-                seg.bias[position] = 0.0
                 if graph:
                     seg.graph.launch(seg.stream)
                 else:
@@ -427,14 +423,11 @@ class GraphDecoder:
         return cp.asnumpy(logits)
 
     def truncate(self, keep: int):
-        """Roll the KV back to `keep` valid positions by re-masking the rest
-        (the cached rows past `keep` become stale but masked, and are
-        overwritten by the next step). Used by speculative decoding."""
-        cp = self.cp
-        for seg in self.segments:
-            with cp.cuda.Device(seg.dev_id), seg.stream:
-                seg.bias[keep:] = -1e30
-            seg.stream.synchronize()
+        """No-op with the flash-decode kernel: attention length is derived from
+        the caller's `position` (valid_len = pos+1), not internal state, so
+        rolling back is just passing a smaller position to the next step(). The
+        stale KV rows past `keep` are simply never visited (and get overwritten).
+        Kept for API compatibility (speculative decoding calls it)."""
 
     def step(self, token_id, position):
         return self._run(token_id, position, graph=True)
@@ -453,17 +446,16 @@ class GraphDecoder:
             for seg in self.segments:
                 with cp.cuda.Device(seg.dev_id):
                     s.append(([c.copy() for c in seg.k_cache],
-                              [c.copy() for c in seg.v_cache], seg.bias.copy()))
+                              [c.copy() for c in seg.v_cache]))
             return s
 
         def restore(s):
-            for seg, (ks, vs, b) in zip(self.segments, s):
+            for seg, (ks, vs) in zip(self.segments, s):
                 with cp.cuda.Device(seg.dev_id), seg.stream:
                     for c, x in zip(seg.k_cache, ks):
                         c[...] = x
                     for c, x in zip(seg.v_cache, vs):
                         c[...] = x
-                    seg.bias[...] = b
                 seg.stream.synchronize()
 
         orig, ref = snap(), snap()

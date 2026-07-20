@@ -80,6 +80,63 @@ def graph_capable(model) -> bool:
     return isinstance(model.layers[0].w.get("self_attn.q_proj.weight"), dict)
 
 
+_ATTN_DECODE: dict = {}
+
+
+def _attn_decode_kernel(cp, ctype: str):
+    """Flash-decode attention RawKernel: one block per query head, D threads.
+    Loops only over VALID keys [0, pos] (read from the device pos buffer), so
+    its cost is O(valid_len) regardless of the KV buffer size — unlike the
+    reduction path which scans the whole max_len buffer every token. GQA-aware
+    (kv_head = h / (H/KVH)), online softmax, fp32 accumulation. Capturable.
+    Requires head_dim D to be a power of two (holds for 64/128)."""
+    key = ctype
+    if key not in _ATTN_DECODE:
+        _ATTN_DECODE[key] = cp.RawKernel(rf"""
+        #include <cuda_fp16.h>
+        extern "C" __global__ void attn_decode_{ctype.replace(' ', '_')}(
+                const float* __restrict__ q,       // (H, D) fp32
+                const {ctype}* __restrict__ kc,    // (max_len, KVH, D)
+                const {ctype}* __restrict__ vc,    // (max_len, KVH, D)
+                float* __restrict__ out,           // (H, D) fp32
+                const int* __restrict__ pos,       // device scalar; valid = pos[0]+1
+                int H, int KVH, int D, float scale) {{
+            int h = blockIdx.x;
+            int d = threadIdx.x;                   // 0..D-1
+            int rep = H / KVH;
+            int kvh = h / rep;
+            extern __shared__ float sh[];
+            float* sq = sh;                        // D
+            float* red = sh + D;                   // D
+            __shared__ float m, l, s_score;
+            sq[d] = q[h * D + d];
+            if (d == 0) {{ m = -1e30f; l = 0.0f; }}
+            float acc = 0.0f;
+            __syncthreads();
+            int VL = pos[0] + 1;
+            for (int j = 0; j < VL; j++) {{
+                long long base = ((long long)j * KVH + kvh) * D;
+                red[d] = sq[d] * (float)kc[base + d];
+                __syncthreads();
+                for (int s = D >> 1; s > 0; s >>= 1) {{
+                    if (d < s) red[d] += red[d + s];
+                    __syncthreads();
+                }}
+                if (d == 0) s_score = red[0] * scale;
+                __syncthreads();
+                float sc = s_score;
+                float new_m = fmaxf(m, sc);
+                float corr = __expf(m - new_m);
+                float p = __expf(sc - new_m);
+                acc = acc * corr + p * (float)vc[base + d];
+                if (d == 0) {{ l = l * corr + p; m = new_m; }}
+                __syncthreads();
+            }}
+            out[h * D + d] = acc / l;
+        }}""", f"attn_decode_{ctype.replace(' ', '_')}")
+    return _ATTN_DECODE[key]
+
+
 _WRITE_KV: dict = {}
 
 
@@ -208,9 +265,11 @@ class GraphDecoder:
         cp = self.cp
         cfg = self.cfg
         H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
-        rep = H // KVH
+        assert (D & (D - 1)) == 0, "flash-decode kernel needs power-of-two head_dim"
         scale = D ** -0.5
-        write = _write_kv_kernel(cp, "float" if self.dtype == cp.float32 else "__half")
+        ctype = "float" if self.dtype == cp.float32 else "__half"
+        write = _write_kv_kernel(cp, ctype)
+        attn = _attn_decode_kernel(cp, ctype)
         row = KVH * D
         blocks = (row + 127) // 128
         cos = seg.cos_tab[seg.pos_idx]
@@ -239,15 +298,13 @@ class GraphDecoder:
             write((blocks,), (128,),
                   (kc, vc, cp.ascontiguousarray(k), cp.ascontiguousarray(v),
                    seg.pos_idx, np.int32(row)))
-            kx = cp.repeat(kc, rep, axis=1)
-            vx = cp.repeat(vc, rep, axis=1)
-            qh = q.reshape(H, D).astype(cp.float32)
-            scores = (qh[None] * kx.astype(cp.float32)).sum(2)
-            scores = scores * cp.float32(scale) + seg.bias[:, None]
-            scores -= scores.max(0, keepdims=True)
-            e = cp.exp(scores)
-            probs = e / e.sum(0, keepdims=True)
-            ctx = (probs[:, :, None] * vx.astype(cp.float32)).sum(0)
+            # flash-decode attention: O(valid_len), not O(max_len)
+            qh = cp.ascontiguousarray(q.reshape(H, D).astype(cp.float32))
+            ctx = cp.empty((H, D), dtype=cp.float32)
+            attn((H,), (D,), (qh, kc, vc, ctx, seg.pos_idx,
+                              np.int32(H), np.int32(KVH), np.int32(D),
+                              np.float32(scale)),
+                 shared_mem=2 * D * 4)
             ctx = ctx.reshape(1, H * D).astype(self.dtype)
             x = x + lin(layer, "self_attn.o_proj", ctx)
 

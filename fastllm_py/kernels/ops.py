@@ -12,13 +12,46 @@ def get_xp(x):
     return np if isinstance(x, np.ndarray) else __import__("cupy")
 
 
+# Flipped to True once _rmsnorm_cupy is verified on-GPU vs the numpy path.
+USE_FUSED_RMSNORM = False
+
+
 def rmsnorm(x, weight, eps: float):
     """x: (..., dim). Computed in fp32 like HF does."""
     xp = get_xp(x)
+    if USE_FUSED_RMSNORM and xp is not np:
+        return _rmsnorm_cupy(x, weight, eps)
     xf = x.astype(xp.float32)
     var = xp.mean(xf * xf, axis=-1, keepdims=True)
     out = xf * (1.0 / xp.sqrt(var + eps))
     return (out * weight.astype(xp.float32)).astype(x.dtype)
+
+
+_rms_var_kernel = None
+_rms_apply_kernel = None
+
+
+def _rmsnorm_cupy(x, weight, eps: float):
+    """Fused RMSNorm: a ReductionKernel for mean(x^2) + an ElementwiseKernel
+    for x*rsqrt(var+eps)*w, replacing ~5 elementwise launches with 2.
+    Computes in fp32, casts back to x.dtype; weight cast to fp32 once."""
+    import cupy as cp
+
+    global _rms_var_kernel, _rms_apply_kernel
+    if _rms_var_kernel is None:
+        _rms_var_kernel = cp.ReductionKernel(
+            "T x", "float32 y", "float32(x) * float32(x)", "a + b",
+            "y = a", "0", "rms_meansq")
+        _rms_apply_kernel = cp.ElementwiseKernel(
+            "T x, float32 inv, W w", "T out",
+            "out = T(float32(x) * inv * float32(w))", "rms_apply")
+
+    dim = x.shape[-1]
+    xf = x.reshape(-1, dim)
+    meansq = _rms_var_kernel(xf, axis=1)          # (rows,) fp32
+    inv = cp.rsqrt(meansq / dim + cp.float32(eps))  # (rows,)
+    out = _rms_apply_kernel(xf, inv[:, None], weight[None, :])
+    return out.reshape(x.shape)
 
 
 def build_rope_cache(positions, head_dim: int, theta: float, xp=np):

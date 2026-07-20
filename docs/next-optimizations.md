@@ -10,27 +10,20 @@ not GPU work — proven by `scripts/diagnose_moe_decode.py` (MoE decode was
 ## 1. Stream-controlled Marlin → CUDA-graph decode capture (biggest lever)
 
 **Problem.** `FastllmCudaMarlinHalfInt4Gemm` hardcodes CUDA **stream 0**
-(the legacy default stream) — see `fastllm-marlin.cu:2666`, the `dev, 0,`
-args to `marlin::marlin_mm<half>`. Stream 0 is an implicit **device-wide
-barrier** against blocking streams, so every Marlin GEMM serializes the whole
-device, and — critically — **legacy-stream work cannot be captured into a
-CUDA graph**. This blocks the single highest-value optimization.
+(the legacy default stream) — `fastllm-marlin.cu:2666`, the `dev, 0,` args to
+`marlin::marlin_mm<half>`. Stream 0 is an implicit **device-wide barrier**
+against blocking streams, so every Marlin GEMM serializes the whole device,
+and — critically — **legacy-stream work cannot be captured into a CUDA graph**.
 
-**Fix.** Add a stream-accepting entry `FastllmCudaMarlinHalfInt4GemmStream(...,
-void* stream)` that forwards the pointer to `marlin_mm`'s stream arg. Two
-routes:
-- Preferred: a thin `native/marlin_stream.cu` that forward-declares
-  `marlin::marlin_mm<half>` (the `__half` instantiation is already a weak
-  symbol in the .so — see `nm -D`) and `vllm::kU4` / `marlin::max_par`, and
-  exposes the extern "C" shim. Risk: pulling the right headers for
-  `vllm::ScalarType`.
-- Fallback: compile a patched *copy* of `fastllm-marlin.cu` in `native/`
-  (leave the upstream tree untouched per project constraint).
+**DONE (2026-07-20): stream-accepting entry.** `FastllmCudaMarlinHalfInt4Gemm
+Stream(..., void* stream)` is built into the .so by patching a build-time
+*copy* of `fastllm-marlin.cu` (upstream untouched) — see
+`native/marlin_stream_entry.inc` + `native/build.sh`. `marlin.gemm_fast(...,
+stream=)` routes to it (bit-identical to the default, tested); INT4 MoE
+experts now run on `compute_stream` instead of stream 0. This unblocks graph
+capture and removes the barrier vs the blocking compute stream.
 
-Then thread a `stream` param through `marlin.gemm_fast` and run the decode
-path on one persistent capturable stream.
-
-**Then CUDA-graph the decode step.** Capture the T=1 forward once and replay
+**TODO: CUDA-graph the decode step.** Capture the T=1 forward once and replay
 (~1 launch instead of ~500-800). Requires static addresses + shapes:
 - KV cache is already a stable capacity-doubling buffer (`KVCache`); the only
   varying shape is attention over S keys. Options: (a) capture per KV-length

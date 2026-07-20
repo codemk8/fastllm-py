@@ -257,15 +257,34 @@ class BatchedDecoder:
             self.pos[:] = base
             self.stream.synchronize()
 
-    def step_graph(self, tokens):
-        """Graph-replay batched step; lm_head (cuBLAS) runs outside the graph."""
+    def step_graph(self, tokens, idle_mask=None):
+        """Graph-replay batched step; lm_head (cuBLAS) runs outside the graph.
+
+        idle_mask (bool, len B): slots with no active sequence. The graph
+        increments every slot's position, so idle slots are pinned to pos -1
+        here (→ 0 after the graph's +1) to keep their attention bounded to one
+        (garbage, ignored) key instead of growing without limit."""
         cp = self.cp
         with cp.cuda.Device(self.dev), self.stream:
+            if idle_mask is not None and idle_mask.any():
+                self.pos[cp.asarray(idle_mask)] = -1
             self.tok_buf[:] = cp.asarray(tokens, dtype=cp.int32)
             self.graph.launch(self.stream)
             logits = matmul_w(self.hidden_out, self.model.lm_head)
         self.stream.synchronize()
         return cp.asnumpy(logits)
+
+    def set_slot(self, slot, kvs, n):
+        """Load one sequence's prefill KV into a slot and set its position, for
+        continuous batching (reuse a captured decoder across requests). Runs on
+        self.stream so the writes are ordered before the next graph step."""
+        cp = self.cp
+        with cp.cuda.Device(self.dev), self.stream:
+            for li in range(len(self.model.layers)):
+                self.k_cache[li][slot, :n] = kvs[li].k.astype(self.dtype)
+                self.v_cache[li][slot, :n] = kvs[li].v.astype(self.dtype)
+            self.pos[slot] = n - 1
+        self.stream.synchronize()
 
     def _rope(self, t, cos, sin, nheads, D):
         """t: (B, nheads, D); cos/sin: (B, D/2) -> half-split rotate."""
@@ -293,3 +312,88 @@ class BatchedDecoder:
             for b in range(self.B):
                 outs[b].append(int(cur[b]))
         return outs
+
+
+class _Req:
+    __slots__ = ("ids", "max_new", "stop", "on_token", "on_done", "produced")
+
+    def __init__(self, ids, max_new, stop, on_token, on_done):
+        self.ids = list(ids)
+        self.max_new = max_new
+        self.stop = set(stop or ())
+        self.on_token = on_token   # callable(token_id)
+        self.on_done = on_done     # callable()
+        self.produced = 0
+
+
+class BatchedEngine:
+    """Continuous-batching scheduler over a captured BatchedDecoder.
+
+    A fixed pool of `max_batch` slots; each step runs the batched graph over all
+    slots (idle ones pinned + ignored). When a sequence finishes (EOS or
+    max_new_tokens) its slot frees and the next queued request is prefilled into
+    it — so sequences join and leave without re-capturing. Greedy decoding;
+    each request's output is identical to its single-stream generation.
+
+    Drive it by calling submit() then step() in a loop until idle (a background
+    thread wraps this for the async server).
+    """
+
+    def __init__(self, model, max_batch: int = 16, max_len: int = 2048):
+        self.model = model
+        self.B = max_batch
+        self.bd = BatchedDecoder(model, max_batch, max_len)
+        self.bd.capture()
+        self.slots: list = [None] * max_batch      # slot -> _Req or None
+        self.cur = np.zeros(max_batch, dtype=np.int64)
+        from collections import deque
+        self.queue = deque()
+
+    def submit(self, ids, max_new_tokens=256, stop_ids=(), on_token=None, on_done=None):
+        self.queue.append(_Req(ids, max_new_tokens, stop_ids, on_token, on_done))
+
+    def _emit(self, slot, req, tok):
+        req.produced += 1
+        if req.on_token:
+            req.on_token(tok)
+        if tok in req.stop or req.produced >= req.max_new:
+            if req.on_done:
+                req.on_done()
+            self.slots[slot] = None
+
+    def _fill_idle(self):
+        for slot in range(self.B):
+            if self.slots[slot] is None and self.queue:
+                req = self.queue.popleft()
+                logits, kvs = self.model.forward(np.asarray(req.ids, dtype=np.int64))
+                self.bd.set_slot(slot, kvs, len(req.ids))
+                cp = self.bd.cp
+                row = cp.asnumpy(logits[-1]) if isinstance(logits, cp.ndarray) else logits[-1]
+                first = int(np.argmax(row))
+                self.cur[slot] = first
+                self.slots[slot] = req
+                self._emit(slot, req, first)   # emit the prefill's first token
+
+    def step(self) -> bool:
+        """Advance all active slots one token. Returns True if any work ran."""
+        self._fill_idle()
+        active = [s for s in range(self.B) if self.slots[s] is not None]
+        if not active:
+            return False
+        idle_mask = np.array([self.slots[s] is None for s in range(self.B)])
+        logits = self.bd.step_graph(self.cur, idle_mask=idle_mask)  # (B, vocab)
+        for slot in active:
+            req = self.slots[slot]
+            if req is None:      # finished during prefill emit this round
+                continue
+            tok = int(logits[slot].argmax())
+            self.cur[slot] = tok
+            self._emit(slot, req, tok)
+        return True
+
+    def run_until_idle(self, max_steps: int = 100000):
+        steps = 0
+        while (any(s is not None for s in self.slots) or self.queue) and steps < max_steps:
+            if not self.step():
+                break
+            steps += 1

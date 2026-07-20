@@ -72,13 +72,22 @@ def route_gpu(logits, top_k, scoring="softmax", bias=None, n_group=0,
 
 def graph_capable(model) -> bool:
     """True if GraphDecoder supports this model: INT4 (Marlin dict) linears,
-    dense (non-MoE, non-MLA). Any number of GPUs."""
+    non-MLA. MoE is supported on a single GPU when experts are INT4-resident
+    (moe_device={"cuda":1} + gpu_expert_quant="int4") — the fused custom-kernel
+    MoE path. Dense supports any GPU count."""
     cfg = model.cfg
-    if cfg.is_mla or cfg.is_moe:
+    if cfg.is_mla:
         return False
     if any(not l.device.startswith("cuda") for l in model.layers):
         return False
-    return isinstance(model.layers[0].w.get("self_attn.q_proj.weight"), dict)
+    if not isinstance(model.layers[0].w.get("self_attn.q_proj.weight"), dict):
+        return False
+    if cfg.is_moe:
+        if len({l.device for l in model.layers}) != 1:
+            return False  # fused MoE kernel is single-GPU
+        ml = next((l.moe for l in model.layers if l.moe is not None), None)
+        return ml is not None and ml.gpu_payloads is not None
+    return True
 
 
 _ATTN_DECODE: dict = {}
@@ -211,11 +220,14 @@ class GraphDecoder:
         import cupy as cp
 
         cfg = model.cfg
-        if cfg.is_mla or cfg.is_moe:
-            raise ValueError("GraphDecoder supports only dense non-MLA models")
+        if cfg.is_mla:
+            raise ValueError("GraphDecoder does not support MLA models")
         if not isinstance(model.layers[0].w.get("self_attn.q_proj.weight"), dict):
             raise ValueError("GraphDecoder requires an INT4 model "
                              "(Model.load(..., linear_quant='int4'))")
+        if cfg.is_moe and not graph_capable(model):
+            raise ValueError("GraphDecoder MoE needs INT4-resident experts "
+                             "(moe_device={'cuda':1}, gpu_expert_quant='int4') on 1 GPU")
 
         self.cp = cp
         self.model = model
@@ -242,6 +254,80 @@ class GraphDecoder:
             self.logits = cp.zeros((model.lm_head.shape[0],), dtype=self.dtype)
         self._captured = False
         self.graph_fellback = False
+        if cfg.is_moe:
+            self._prepare_moe()
+
+    def _prepare_moe(self):
+        """Build per-MoE-layer graph data: fp16 gate weights + row-major INT4
+        stacked experts (routed + shared), plus reusable device scratch. All on
+        the single GPU. Enables the capturable fused MoE decode branch."""
+        cp = self.cp
+        from .kernels import moe_int4
+
+        cfg = self.cfg
+        dev = self.segments[0].dev_id
+        E = cfg.num_experts
+        first = next(l.moe for l in self.model.layers if l.moe is not None)
+        inter = first._materialize_cpu(0)["gate"].shape[0]
+        sinter = first.shared["gate"].shape[0] if first.shared is not None else 0
+        self._moe = {"E": E, "inter": inter, "sinter": sinter,
+                     "has_shared": first.shared is not None,
+                     "has_sgate": first.shared_gate is not None}
+        with cp.cuda.Device(dev):
+            self._moe_lbuf = cp.empty((E,), dtype=cp.float32)
+            self._moe_ibuf = cp.empty((E, inter), dtype=cp.float32)
+            self._moe_rw = cp.empty((E,), dtype=cp.float32)
+            self._moe_out = cp.empty((cfg.hidden_dim,), dtype=cp.float32)
+            self._moe_srw = cp.ones((1,), dtype=cp.float32)
+            self._moe_sout = cp.empty((cfg.hidden_dim,), dtype=cp.float32)
+            self._moe_sibuf = cp.empty((1, max(sinter, 1)), dtype=cp.float32)
+            for layer in self.model.layers:
+                ml = getattr(layer, "moe", None)
+                if ml is None:
+                    continue
+                ews = [ml._materialize_cpu(e) for e in range(E)]
+                layer._gmoe = {
+                    "gate_w": ml.gate_weight.astype(cp.float16),
+                    "stacked": moe_int4.build_stacked_experts(ews, 128, xp=cp),
+                    "shared": (moe_int4.build_stacked_experts([ml.shared], 128, xp=cp)
+                               if ml.shared is not None else None),
+                    "shared_gate_w": (ml.shared_gate.astype(cp.float16)
+                                      if ml.shared_gate is not None else None),
+                }
+
+    def _moe_branch(self, layer, h):
+        """Capturable fused MoE FFN for one decode token. h: (1, hidden).
+        Returns (hidden,) fp32: routed experts + shared expert."""
+        cp = self.cp
+        cfg = self.cfg
+        from .kernels import moe_int4
+
+        gm = layer._gmoe
+        M = self._moe
+        xr = h[0]
+        # gate (custom matvec, no cuBLAS) + top-k routing (sort threshold)
+        moe_int4.gate_matvec(xr, gm["gate_w"], M["E"], cfg.hidden_dim, out=self._moe_lbuf)
+        e = cp.exp(self._moe_lbuf - self._moe_lbuf.max())
+        probs = e / e.sum()
+        K = cfg.num_experts_per_tok
+        kth = cp.sort(probs)[-K]
+        rw = cp.where(probs >= kth, probs, 0.0)
+        if cfg.norm_topk_prob:
+            rw = rw / (rw.sum() + 1e-20)
+        self._moe_rw[:] = rw * cfg.routed_scaling_factor
+        moe_int4.fused_moe_weighted(xr, gm["stacked"], self._moe_rw, M["E"],
+                                    cfg.hidden_dim, M["inter"], out=self._moe_out,
+                                    inter_buf=self._moe_ibuf)
+        if gm["shared"] is not None:
+            moe_int4.fused_moe_weighted(xr, gm["shared"], self._moe_srw, 1,
+                                        cfg.hidden_dim, M["sinter"], out=self._moe_sout,
+                                        inter_buf=self._moe_sibuf)
+            if gm["shared_gate_w"] is not None:
+                sg = moe_int4.gate_matvec(xr, gm["shared_gate_w"], 1, cfg.hidden_dim)
+                self._moe_out += self._moe_sout * (1.0 / (1.0 + cp.exp(-sg[0])))
+            else:
+                self._moe_out += self._moe_sout
+        return self._moe_out
 
     # ------------------------------------------------------------ per segment
     def _mm(self, seg, inp, w):
@@ -309,9 +395,12 @@ class GraphDecoder:
             x = x + lin(layer, "self_attn.o_proj", ctx)
 
             h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)
-            g = self._mm(seg, h, layer.w["mlp.gate_proj.weight"])
-            u = self._mm(seg, h, layer.w["mlp.up_proj.weight"])
-            x = x + self._mm(seg, swiglu(g, u), layer.w["mlp.down_proj.weight"])
+            if getattr(layer, "_gmoe", None) is not None:
+                x = x + self._moe_branch(layer, h)[None]
+            else:
+                g = self._mm(seg, h, layer.w["mlp.gate_proj.weight"])
+                u = self._mm(seg, h, layer.w["mlp.up_proj.weight"])
+                x = x + self._mm(seg, swiglu(g, u), layer.w["mlp.down_proj.weight"])
 
         if seg.is_last:  # final norm here; lm_head runs outside the graph
             seg.hidden_out[:] = rmsnorm(x, self.model.final_norm, cfg.norm_eps)[0]

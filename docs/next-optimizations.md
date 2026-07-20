@@ -35,17 +35,31 @@ stream (a default-stream write race was the long-hunted correctness bug).
 Remaining: single-GPU + non-MLA only (67B is 2-GPU; MLA/MoE need the routing
 D2H sync moved on-device — see #2).
 
-## 2. Fused MoE kernel (kills per-expert dispatch + routing syncs)
+## 2. Fused MoE kernel (kills per-expert dispatch)
 
-MoE decode does, per layer: a gate matmul + `cp.asnumpy(logits)` (a hard D2H
-**sync**, 24×/token) to route on CPU, then a Python loop over top-k experts
-each doing cache lookup + 2 H2D copies + 3 Marlin calls + scatter. That
-per-expert Python is the MoE floor.
+**Measured correction (2026-07-20): the MoE floor was NOT Python dispatch — it
+was expert upload/cache-thrash.** With all experts made INT4-**resident** on
+GPU (`moe_device={"cuda":1}` + `gpu_expert_quant="int4"` + a cache big enough
+to hold them), Qwen1.5-MoE-A2.7B eager decode is **~25.7 tok/s** — vs the
+~6.4 tok/s benchmark that offloaded 75% of experts to CPU (upload-bound). So
+for MoE that **fits in VRAM at INT4** (Qwen1.5-MoE experts = 5.8 GB, V2-Lite,
+moe-16b all fit), the win is simply residency — no kernel work needed. Use the
+resident config.
 
-Target: a grouped/batched expert GEMM that takes the routing on-device (top-k
-via `cupy` argpartition) and runs all activated experts without a host loop or
-per-layer D2H sync. This is what vLLM/sglang fused-MoE kernels do. Large but
-it's the only way to get MoE decode competitive.
+**Dead-end tried + reverted:** dense-over-experts CUDA-graph MoE (compute all E
+experts in a graph, weight-mask to top-k via the capturable `route_gpu`
+helper). Measured **0.84×** — with resident experts, eager top-4 isn't
+dispatch-bound, and computing all 60 experts (15× the GEMVs) costs more than
+the dispatch it removes. `route_gpu` (on-GPU group-limited routing) is kept as
+the routing half of a future fused kernel; the rest was reverted.
+
+**Only remaining lever, and only for experts that DON'T fit** (the 671B target):
+a **fused selective gather-GEMV kernel** — gathers just the routed top-k
+experts' INT4 weights on-device (data-dependent indices) and runs their FFNs in
+one launch, with routing on-device. This is what vLLM/sglang/ktransformers
+wrote; it's the real (multi-week) kernel work and the only path to competitive
+*offloaded* MoE decode. A graph can't substitute for it (per-token expert
+uploads aren't capturable).
 
 ## 3. FlashInfer paged attention + continuous batching
 

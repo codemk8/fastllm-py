@@ -50,11 +50,16 @@ path. Pass `use_graph=False` to force eager.
 
 ## Speculative decoding
 
-Greedy speculative decoding (`fastllm_py/speculative.py`) — a small draft
-proposes γ tokens, the target verifies in one forward. Output is **identical to
-greedy target decoding**. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU:
-**2.03×** (γ=4, 68% draft acceptance; target forwards 96 → 30). The draft
-rollout runs on the graph decoder, so this composes with graph decode.
+Speculative decoding (`fastllm_py/speculative.py`) — a small draft proposes γ
+tokens, the target verifies in one forward. **Greedy mode** output is *identical
+to greedy target decoding*; **sampling mode** (temperature>0) uses rejection
+sampling (Leviathan/Chen), so the output distribution is *exactly the target's
+own* truncated sampling distribution — both modes are pure latency wins, quality
+unchanged. Qwen3-8B target / Qwen3-0.6B draft, both INT4, 1 GPU: **2.03×** greedy
+(γ=4, 68% draft acceptance; target forwards 96 → 30). The draft rollout runs on
+the graph decoder, so this composes with graph decode. The rejection step is
+unit-tested to reproduce the target distribution for arbitrary draft/target
+(`tests/test_speculative_sampling.py`).
 
 Unlike graph decode, speculative can't be "on by default" — it needs a second
 draft model sharing the target's vocab, which is a model-selection/resource

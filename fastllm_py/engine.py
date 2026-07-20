@@ -93,8 +93,9 @@ class AsyncEngine:
             ids = np.asarray(req.token_ids, dtype=np.int64)
             n_prompt = len(ids)
             produced = 0
-            # speculative path: greedy only (identical to greedy target decode)
-            use_spec = (self.spec is not None and req.temperature == 0.0
+            # speculative path: greedy (identical to greedy target) OR sampled
+            # (rejection sampling preserves the target's sampling distribution).
+            use_spec = (self.spec is not None
                         and n_prompt + req.max_new_tokens < self.graph_max_len)
             use_graph = (not use_spec and self.gd is not None
                          and n_prompt + req.max_new_tokens < self.graph_max_len)
@@ -109,7 +110,8 @@ class AsyncEngine:
                     emit(tok)
 
                 self.spec.generate(ids, max_new_tokens=req.max_new_tokens,
-                                   stop_ids=req.stop_token_ids, on_token=_on)
+                                   stop_ids=req.stop_token_ids, on_token=_on,
+                                   temperature=req.temperature, top_p=req.top_p)
                 produced = state["n"]
                 t_prefill = state.get("t_prefill", time.time() - t0)
             elif use_graph:

@@ -39,14 +39,12 @@ from .kernels.ops import apply_rope, rmsnorm, swiglu
 from .model import matmul_w
 
 
-def sample_logits(logits, temperature: float = 0.0, top_p: float = 1.0,
-                  top_k: int = 0, rng=None) -> int:
-    """Pick a token id from a (vocab,) numpy logit vector. temperature<=0 is
-    greedy argmax; otherwise temperature-scale -> optional top-k -> optional
-    nucleus (top-p) -> categorical sample. rng is an optional np.random.Generator
-    for reproducibility (falls back to the global RNG)."""
-    if temperature <= 0.0:
-        return int(np.argmax(logits))
+def logits_to_probs(logits, temperature: float, top_p: float = 1.0,
+                    top_k: int = 0) -> np.ndarray:
+    """(vocab,) logits -> normalized probability vector after temperature scale,
+    optional top-k, and optional nucleus (top-p) truncation. temperature must be
+    > 0. This is the sampling distribution both the plain sampler and
+    speculative sampling draw from (so their transforms stay identical)."""
     lg = np.asarray(logits, dtype=np.float64) / temperature
     lg -= lg.max()
     probs = np.exp(lg)
@@ -62,8 +60,19 @@ def sample_logits(logits, temperature: float = 0.0, top_p: float = 1.0,
         if len(cutoff) > 1:            # keep the first token to cross top_p
             probs[cutoff[1:]] = 0.0
             probs /= probs.sum()
-    draw = (rng or np.random).choice(probs.size, p=probs)
-    return int(draw)
+    return probs
+
+
+def sample_logits(logits, temperature: float = 0.0, top_p: float = 1.0,
+                  top_k: int = 0, rng=None) -> int:
+    """Pick a token id from a (vocab,) numpy logit vector. temperature<=0 is
+    greedy argmax; otherwise temperature-scale -> optional top-k -> optional
+    nucleus (top-p) -> categorical sample. rng is an optional np.random.Generator
+    for reproducibility (falls back to the global RNG)."""
+    if temperature <= 0.0:
+        return int(np.argmax(logits))
+    probs = logits_to_probs(logits, temperature, top_p, top_k)
+    return int((rng or np.random).choice(probs.size, p=probs))
 
 
 def route_gpu(logits, top_k, scoring="softmax", bias=None, n_group=0,

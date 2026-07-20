@@ -108,6 +108,10 @@ def main():
     p.add_argument("--moe-device", default='{"cpu": 1}')
     p.add_argument("--expert-dtype", default="float16")
     p.add_argument("--gpu-cache-gb", type=float, default=8.0)
+    p.add_argument("--linear-quant", default="none", choices=["none", "int4"],
+                   help="quantize dense linears to INT4 (enables CUDA-graph decode)")
+    p.add_argument("--no-cuda-graph", action="store_true",
+                   help="disable CUDA-graph decode even for INT4 dense models")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -117,6 +121,7 @@ def main():
         moe_device=MoeDeviceMap(json.loads(args.moe_device)),
         expert_dtype=args.expert_dtype,
         gpu_cache_bytes=int(args.gpu_cache_gb * 2**30),
+        linear_quant=args.linear_quant,
     )
     stop_ids = [tok.eos_token_id] if tok.eos_token_id is not None else []
     extra = tok.convert_tokens_to_ids("<|im_end|>")
@@ -128,8 +133,11 @@ def main():
 
     @app.on_event("startup")
     async def _start():
-        STATE["engine"] = AsyncEngine(model)
-        await STATE["engine"].start()
+        eng = AsyncEngine(model, cuda_graph=not args.no_cuda_graph)
+        STATE["engine"] = eng
+        await eng.start()
+        print(f"[fastllm] decode path: "
+              f"{'cuda_graph' if eng.gd is not None else 'eager'}")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

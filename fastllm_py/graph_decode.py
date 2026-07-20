@@ -39,6 +39,19 @@ import numpy as np
 from .kernels.ops import apply_rope, build_rope_cache, rmsnorm, softmax, swiglu
 from .model import matmul_w
 
+def graph_capable(model) -> bool:
+    """True if GraphDecoder supports this model: INT4 (Marlin dict) linears,
+    dense (non-MoE, non-MLA), all layers on one GPU."""
+    cfg = model.cfg
+    if cfg.is_mla or cfg.is_moe:
+        return False
+    if len({l.device for l in model.layers}) != 1:
+        return False
+    if not next(iter({l.device for l in model.layers})).startswith("cuda"):
+        return False
+    return isinstance(model.layers[0].w.get("self_attn.q_proj.weight"), dict)
+
+
 _WRITE_KV: dict = {}
 
 
@@ -210,6 +223,9 @@ class GraphDecoder:
         if n > self.max_len - 1:
             raise ValueError(f"prompt {n} exceeds max_len {self.max_len}")
         with cp.cuda.Device(self.dev_id):
+            # reset the mask so a reused decoder doesn't see a prior request's
+            # valid slots, then mark this prompt's positions valid
+            self.bias.fill(-1e30)
             for li in range(len(self.model.layers)):
                 self.k_cache[li][:n] = kvs[li].k.astype(self.dtype)
                 self.v_cache[li][:n] = kvs[li].v.astype(self.dtype)

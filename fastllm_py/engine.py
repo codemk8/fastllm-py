@@ -45,10 +45,26 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float) -> int:
 
 
 class AsyncEngine:
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, cuda_graph: bool = True, graph_max_len: int = 8192):
         self.model = model
         self.requests: asyncio.Queue[GenRequest] = asyncio.Queue()
         self._task = None
+        self.graph_max_len = graph_max_len
+        self.gd = None  # lazily-captured GraphDecoder (single-stream decode)
+        if cuda_graph:
+            try:
+                from .graph_decode import GraphDecoder, graph_capable
+
+                if graph_capable(model):
+                    gd = GraphDecoder(model, max_len=graph_max_len)
+                    gd.capture()
+                    # one-time bit-exact check vs eager; only keep if it holds
+                    probe = np.array([1, 2, 3, 4, 5], dtype=np.int64)
+                    first, pos = gd.prime(probe)
+                    if gd.verify(int(np.argmax(first)), pos):
+                        self.gd = gd
+            except Exception:
+                self.gd = None  # any capture/verify failure -> eager path
 
     async def start(self):
         self._task = asyncio.create_task(self._worker())
@@ -58,19 +74,41 @@ class AsyncEngine:
         return req
 
     async def _worker(self):
-        import cupy as cp
-
         loop = asyncio.get_running_loop()
         while True:
             req = await self.requests.get()
-            try:
-                t0 = time.time()
-                kvs = None
-                ids = np.asarray(req.token_ids, dtype=np.int64)
-                n_prompt = len(ids)
-                produced = 0
-                logits, kvs = await loop.run_in_executor(
-                    None, self.model.forward, ids, kvs)
+            # Run the whole generation on ONE worker thread and stream tokens
+            # back via the loop. Per-token run_in_executor round-trips would
+            # otherwise dominate at graph-decode speeds (~5ms/token).
+            await loop.run_in_executor(None, self._generate, req, loop)
+
+    def _generate(self, req: GenRequest, loop):
+        """Runs in a thread. Streams tokens to req.queue thread-safely."""
+        import cupy as cp
+
+        def emit(x):
+            loop.call_soon_threadsafe(req.queue.put_nowait, x)
+
+        try:
+            t0 = time.time()
+            ids = np.asarray(req.token_ids, dtype=np.int64)
+            n_prompt = len(ids)
+            produced = 0
+            use_graph = (self.gd is not None
+                         and n_prompt + req.max_new_tokens < self.graph_max_len)
+            if use_graph:
+                last, pos = self.gd.prime(ids)
+                t_prefill = time.time() - t0
+                while produced < req.max_new_tokens:
+                    nxt = _sample(last, req.temperature, req.top_p)
+                    produced += 1
+                    emit(nxt)
+                    if nxt in req.stop_token_ids:
+                        break
+                    last = self.gd.step(nxt, pos)
+                    pos += 1
+            else:
+                logits, kvs = self.model.forward(ids, None)
                 t_prefill = time.time() - t0
                 while produced < req.max_new_tokens:
                     last = logits[-1]
@@ -78,23 +116,23 @@ class AsyncEngine:
                         last = cp.asnumpy(last)
                     nxt = _sample(last, req.temperature, req.top_p)
                     produced += 1
-                    await req.queue.put(nxt)
+                    emit(nxt)
                     if nxt in req.stop_token_ids:
                         break
-                    logits, kvs = await loop.run_in_executor(
-                        None, self.model.forward, np.asarray([nxt]), kvs)
-                dt = time.time() - t0 - t_prefill
-                req.stats = {
-                    "prompt_tokens": n_prompt,
-                    "completion_tokens": produced,
-                    "prefill_s": round(t_prefill, 3),
-                    "decode_tok_s": round(produced / dt, 2) if dt > 0 else None,
-                }
-            except Exception as e:  # keep the worker alive; report per-request
-                import traceback
+                    logits, kvs = self.model.forward(np.asarray([nxt]), kvs)
+            dt = time.time() - t0 - t_prefill
+            req.stats = {
+                "prompt_tokens": n_prompt,
+                "completion_tokens": produced,
+                "prefill_s": round(t_prefill, 3),
+                "decode_tok_s": round(produced / dt, 2) if dt > 0 else None,
+                "decode_path": "cuda_graph" if use_graph else "eager",
+            }
+        except Exception as e:  # keep the worker alive; report per-request
+            import traceback
 
-                traceback.print_exc()
-                req.stats["error"] = repr(e)
-            finally:
-                await req.queue.put(None)  # sentinel
-                req.done.set()
+            traceback.print_exc()
+            req.stats["error"] = repr(e)
+        finally:
+            emit(None)  # sentinel
+            loop.call_soon_threadsafe(req.done.set)

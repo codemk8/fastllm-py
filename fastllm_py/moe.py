@@ -59,24 +59,26 @@ def build_marlin_expert_payload(w_fp16: dict, group_size: int = 128) -> dict:
     return payload
 
 
-def _expert_ffn_marlin(x_fp16, w):
+def _expert_ffn_marlin(x_fp16, w, stream=None):
     """Marlin INT4 expert ffn. w: uploaded payload dict (GPU arrays).
 
     Uses marlin.gemm_fast (lean, no per-call conversions/validation) since
-    payloads are pre-validated + contiguous. Ordering is provided by the
-    caller's per-layer compute_stream.synchronize(), not per-GEMM syncs.
+    payloads are pre-validated + contiguous. When `stream` is given, Marlin
+    runs on it (same stream as the surrounding cupy ops) instead of legacy
+    stream 0 — avoids the device-wide barrier stream 0 imposes on the
+    blocking compute stream.
     """
     from .kernels.marlin import gemm_fast
 
     hidden = x_fp16.shape[1]
     inter = w["gate.scales"].shape[1]
     g = gemm_fast(x_fp16, w["gate.qweight"], w["gate.scales"], w["gate.zeros"],
-                  inter, hidden)
+                  inter, hidden, stream=stream)
     u = gemm_fast(x_fp16, w["up.qweight"], w["up.scales"], w["up.zeros"],
-                  inter, hidden)
+                  inter, hidden, stream=stream)
     act = swiglu(g, u)
     return gemm_fast(act, w["down.qweight"], w["down.scales"], w["down.zeros"],
-                     hidden, inter)
+                     hidden, inter, stream=stream)
 
 
 class MoELayer:
@@ -95,6 +97,12 @@ class MoELayer:
         self.e_score_bias = e_score_bias        # DeepSeek V3 e_score_correction_bias
         self.experts_cpu = expert_weights_cpu   # eid -> {gate,up,down} np arrays or callable
         self.gpu_payloads = gpu_payloads        # eid -> marlin int4 payload (or None=fp16)
+        if gpu_payloads is not None:
+            from .kernels import marlin
+
+            self._marlin_stream = marlin.has_stream_gemm()
+        else:
+            self._marlin_stream = False
         self.placement = placement
         self.cache = cache
         self.estimator = estimator
@@ -127,6 +135,9 @@ class MoELayer:
     def _run_gpu_experts(self, x_gpu, tasks: list[ExpertTask], out_gpu):
         cp = self.cp
         marlin_mode = self.gpu_payloads is not None
+        # run Marlin on the same (blocking) compute stream as the cupy ops so
+        # there's no legacy-stream-0 device barrier between them
+        mstream = self.compute_stream if (marlin_mode and self._marlin_stream) else None
         with self.compute_stream:
             x16 = x_gpu.astype(cp.float16) if marlin_mode else None
             for t in tasks:
@@ -138,7 +149,7 @@ class MoELayer:
                     xin = xin[None]  # (1, hidden)
                 wgt = cp.asarray(t.weights)[:, None]
                 if marlin_mode:
-                    y = _expert_ffn_marlin(xin, w).astype(cp.float32) * wgt
+                    y = _expert_ffn_marlin(xin, w, stream=mstream).astype(cp.float32) * wgt
                 else:
                     y = _expert_ffn(xin, w, cp) * wgt
                 y = y.astype(out_gpu.dtype)

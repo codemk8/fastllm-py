@@ -82,11 +82,12 @@ class Model:
     # ------------------------------------------------------------- loading
     @classmethod
     def load(cls, model_path: str, device_map: DeviceMap | None = None,
-             dtype: str = "float32") -> "Model":
+             dtype: str = "float32", moe_device: "MoeDeviceMap | None" = None,
+             expert_dtype: str = "float16", gpu_cache_bytes: int = 8 << 30) -> "Model":
         from .config import load_config
 
         cfg = load_config(model_path)
-        store = WeightStore(model_path, bf16_to=dtype)
+        store = WeightStore(model_path, bf16_to="float32")
         m = cls(cfg, dtype)
         devices = (device_map or DeviceMap({"cuda:0": 1})).assign(cfg.num_layers)
 
@@ -110,12 +111,16 @@ class Model:
             "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
         ]
         for i, dev in enumerate(devices):
-            layer = DecoderLayer(idx=i, device=dev, is_moe=cfg.is_moe_layer(i))
             base = f"{prefix}layers.{i}."
+            is_moe = cfg.is_moe_layer(i) and (base + "mlp.gate.weight" in store)
+            layer = DecoderLayer(idx=i, device=dev, is_moe=is_moe)
             for name in per_layer_names:
                 if base + name in store:
                     layer.w[name] = up(base + name, dev)
             m.layers.append(layer)
+            if is_moe:
+                m._attach_moe(layer, base, store, up, moe_device, expert_dtype,
+                              gpu_cache_bytes)
 
         m.head_device = last_dev
         m.final_norm = up(f"{prefix}norm.weight", last_dev)
@@ -125,6 +130,62 @@ class Model:
             m.lm_head = to_device(m.embed, last_dev)
         m.store = store
         return m
+
+    def _attach_moe(self, layer: DecoderLayer, base: str, store: WeightStore,
+                    up, moe_device, expert_dtype: str, gpu_cache_bytes: int):
+        """Build a MoELayer for this decoder layer from checkpoint names."""
+        import numpy as np
+
+        from .device_router import MoeDeviceMap
+        from .expert_cache import GpuExpertCache
+        from .expert_router import ExpertPlacement, SpeedEstimator
+        from .moe import MoELayer
+
+        if not hasattr(self, "_moe_shared"):
+            dev_id = int(layer.device.split(":")[1]) if ":" in layer.device else 0
+            self._moe_shared = {
+                "cache": GpuExpertCache(gpu_cache_bytes, device=dev_id),
+                "estimator": SpeedEstimator(),
+                "pool": None,
+            }
+        moe_device = moe_device or MoeDeviceMap({"cpu": 1})
+
+        gate_w = up(base + "mlp.gate.weight", layer.device)
+        gate_bias = (up(base + "mlp.gate.bias", layer.device)
+                     if base + "mlp.gate.bias" in store else None)
+        e_bias = (store.get_f32(base + "mlp.gate.e_score_correction_bias")
+                  if base + "mlp.gate.e_score_correction_bias" in store else None)
+
+        experts, placement = {}, {}
+        eid = 0
+        while base + f"mlp.experts.{eid}.gate_proj.weight" in store:
+            keys = {p: base + f"mlp.experts.{eid}.{p}_proj.weight"
+                    for p in ("gate", "up", "down")}
+            experts[eid] = {
+                p: store.get(k).astype(expert_dtype) for p, k in keys.items()
+            }
+            eid += 1
+        for e in range(eid):
+            placement[e] = moe_device.expert_device(e, eid)
+
+        shared = shared_gate = None
+        for sname in ("mlp.shared_expert.", "mlp.shared_experts."):
+            if base + sname + "gate_proj.weight" in store:
+                shared = {p: up(base + f"{sname}{p}_proj.weight", layer.device)
+                          for p in ("gate", "up", "down")}
+                break
+        if base + "mlp.shared_expert_gate.weight" in store:
+            shared_gate = up(base + "mlp.shared_expert_gate.weight", layer.device)
+
+        layer.moe = MoELayer(
+            self.cfg, layer.idx, gate_w, experts,
+            ExpertPlacement(placement), self._moe_shared["cache"],
+            self._moe_shared["estimator"], shared_weights=shared,
+            shared_gate=shared_gate, gate_bias=gate_bias, e_score_bias=e_bias,
+            pool=self._moe_shared["pool"],
+        )
+        if self._moe_shared["pool"] is None:
+            self._moe_shared["pool"] = layer.moe.pool
 
     # ------------------------------------------------------------- forward
     def _attention(self, layer: DecoderLayer, x, positions, kv: KVCache):

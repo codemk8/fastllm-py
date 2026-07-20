@@ -29,7 +29,7 @@ def _expert_ffn(x, w, xp):
 class MoELayer:
     def __init__(self, cfg, layer_idx: int, gate_weight, expert_weights_cpu,
                  placement: ExpertPlacement, cache: GpuExpertCache,
-                 estimator: SpeedEstimator, shared_weights=None,
+                 estimator: SpeedEstimator, shared_weights=None, shared_gate=None,
                  gate_bias=None, e_score_bias=None, pool: ThreadPoolExecutor | None = None):
         import cupy as cp
 
@@ -44,10 +44,13 @@ class MoELayer:
         self.cache = cache
         self.estimator = estimator
         self.shared = shared_weights            # dense shared expert(s) on GPU
+        self.shared_gate = shared_gate          # qwen2_moe: sigmoid gate (1, hidden)
         import os
 
         self.pool = pool or ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
-        self.compute_stream = cp.cuda.Stream(non_blocking=True)
+        # blocking stream: implicit ordering vs null-stream work (attention),
+        # still overlaps with the cache's copy stream and CPU threads
+        self.compute_stream = cp.cuda.Stream()
 
     # ---- device-side helpers -------------------------------------------
     def _gpu_expert_weights(self, eid: int):
@@ -115,10 +118,15 @@ class MoELayer:
             self._run_gpu_experts(x, gpu_set, out_gpu)
         if self.shared is not None:
             with self.compute_stream:
-                out_gpu += _expert_ffn(x, self.shared, cp).astype(cp.float32)
+                s = _expert_ffn(x, self.shared, cp).astype(cp.float32)
+                if self.shared_gate is not None:
+                    g = (x @ self.shared_gate.T).astype(cp.float32)
+                    s = s * (1.0 / (1.0 + cp.exp(-g)))
+                out_gpu += s
 
         if cpu_future is not None:
             cpu_out = cpu_future.result()
-            out_gpu += cp.asarray(cpu_out)  # async DMA then add
+            with self.compute_stream:
+                out_gpu += cp.asarray(cpu_out)  # DMA + add, ordered on stream
         self.compute_stream.synchronize()
         return out_gpu.astype(x.dtype)

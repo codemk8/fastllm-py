@@ -23,6 +23,21 @@ concurrently.
 | Speed-estimator calibration (CPU/GPU crossover threshold) | ✅ |
 | FlashInfer paged attention, speculative decoding | ⏳ planned |
 
+## CUDA-graph decode (INT4, single GPU)
+
+Capturing the whole per-token decode step as a CUDA graph and replaying it as
+one launch gives a large speedup on dispatch-bound decode — **bit-exact vs
+eager**, with a runtime verify + eager fallback (`fastllm_py/graph_decode.py`):
+
+| Model (INT4) | eager | graph | speedup |
+|---|---|---|---|
+| Qwen3-0.6B | 43 | **213** | 4.9× |
+| deepseek-coder-1.3b | 60 | **277** | 4.6× |
+| R1-Distill-Qwen-1.5B | 49 | **205** | 4.2× |
+| Qwen3-8B | 34 | **89** | 2.6× |
+
+Full detail: `benchmarks/GRAPH_RESULTS.md`. Scope: dense non-MLA, single GPU.
+
 ## Measured performance
 
 Dev box: 2× RTX 4090 (24 GB), 93 GB RAM. Single-stream greedy decode.

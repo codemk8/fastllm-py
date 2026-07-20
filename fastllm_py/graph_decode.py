@@ -39,6 +39,33 @@ from .kernels.ops import apply_rope, rmsnorm, swiglu
 from .model import matmul_w
 
 
+def sample_logits(logits, temperature: float = 0.0, top_p: float = 1.0,
+                  top_k: int = 0, rng=None) -> int:
+    """Pick a token id from a (vocab,) numpy logit vector. temperature<=0 is
+    greedy argmax; otherwise temperature-scale -> optional top-k -> optional
+    nucleus (top-p) -> categorical sample. rng is an optional np.random.Generator
+    for reproducibility (falls back to the global RNG)."""
+    if temperature <= 0.0:
+        return int(np.argmax(logits))
+    lg = np.asarray(logits, dtype=np.float64) / temperature
+    lg -= lg.max()
+    probs = np.exp(lg)
+    probs /= probs.sum()
+    if top_k and 0 < top_k < probs.size:
+        drop = np.argpartition(probs, -top_k)[:-top_k]
+        probs[drop] = 0.0
+        probs /= probs.sum()
+    if top_p < 1.0:
+        order = np.argsort(-probs)
+        csum = np.cumsum(probs[order])
+        cutoff = order[csum > top_p]
+        if len(cutoff) > 1:            # keep the first token to cross top_p
+            probs[cutoff[1:]] = 0.0
+            probs /= probs.sum()
+    draw = (rng or np.random).choice(probs.size, p=probs)
+    return int(draw)
+
+
 def route_gpu(logits, top_k, scoring="softmax", bias=None, n_group=0,
               topk_group=0, norm=False, scale=1.0):
     """On-GPU expert routing using ONLY capturable ops (exp/sort/where/sum —
@@ -567,7 +594,8 @@ class GraphDecoder:
 
     # ------------------------------------------------------------- generate
     def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = True,
-                 verify: bool = True, stop_ids=None):
+                 verify: bool = True, stop_ids=None, temperature: float = 0.0,
+                 top_p: float = 1.0, top_k: int = 0, seed=None):
         if use_graph:
             self.resize(len(prompt_ids) + max_new_tokens)  # tight max_len (+capture)
         elif not self._captured:
@@ -575,16 +603,20 @@ class GraphDecoder:
         first, pos = self.prime(prompt_ids)
         step = self.step if use_graph else self.step_eager
         self.graph_fellback = False
+        # verify probes the graph teacher-forced on argmax (deterministic),
+        # independent of the sampling mode used for the actual rollout.
         if use_graph and verify and not self.verify(int(np.argmax(first)), pos):
             step = self.step_eager
             self.graph_fellback = True
-        out = [int(np.argmax(first))]
+        rng = np.random.default_rng(seed) if temperature > 0.0 else None
+        pick = lambda lg: sample_logits(lg, temperature, top_p, top_k, rng)
+        out = [pick(first)]
         if stop_ids and out[-1] in stop_ids:
             return out
         for _ in range(max_new_tokens - 1):
             logits = step(out[-1], pos)
             pos += 1
-            out.append(int(np.argmax(logits)))
+            out.append(pick(logits))
             if stop_ids and out[-1] in stop_ids:
                 break
         return out

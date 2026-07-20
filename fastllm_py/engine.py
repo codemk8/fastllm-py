@@ -28,20 +28,9 @@ class GenRequest:
 
 
 def _sample(logits: np.ndarray, temperature: float, top_p: float) -> int:
-    if temperature <= 0.0:
-        return int(np.argmax(logits))
-    logits = logits.astype(np.float64) / temperature
-    logits -= logits.max()
-    probs = np.exp(logits)
-    probs /= probs.sum()
-    if top_p < 1.0:
-        order = np.argsort(-probs)
-        csum = np.cumsum(probs[order])
-        cutoff = order[csum > top_p]
-        if len(cutoff) > 1:
-            probs[cutoff[1:]] = 0.0
-            probs /= probs.sum()
-    return int(np.random.choice(len(probs), p=probs))
+    from .graph_decode import sample_logits
+
+    return sample_logits(logits, temperature, top_p)
 
 
 class AsyncEngine:

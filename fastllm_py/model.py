@@ -306,9 +306,10 @@ class Model:
         qf = q.astype(xp.float32).transpose(1, 0, 2)
         kf = k_all.astype(xp.float32).transpose(1, 2, 0)
         scores = (qf @ kf) * xp.float32(scale)
-        q_pos = xp.arange(S - T, S)[:, None]
-        mask = xp.arange(S)[None, :] > q_pos
-        scores = xp.where(mask[None], xp.float32(-1e30), scores)
+        if T > 1:  # decode (T==1) is a single new token attending to all keys
+            q_pos = xp.arange(S - T, S)[:, None]
+            mask = xp.arange(S)[None, :] > q_pos
+            scores = xp.where(mask[None], xp.float32(-1e30), scores)
         probs = softmax(scores, axis=-1)
         ctx = probs @ v_all.astype(xp.float32).transpose(1, 0, 2)
         return ctx.transpose(1, 0, 2).reshape(T, -1)

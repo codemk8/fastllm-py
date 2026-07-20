@@ -31,10 +31,10 @@ def eager_run(n):
     cp.cuda.Device(1).synchronize()
     return n / (time.time() - t0)
 
-gd = GraphDecoder(m, max_len=2048)
+gd = GraphDecoder(m)
+gd.resize(len(ids) + 64)   # tight max_len: attention is O(max_len)/token
 print(f"segments: {len(gd.segments)} "
-      f"(layers/dev: {[len(s.layers) for s in gd.segments]})", flush=True)
-gd.capture()
+      f"(layers/dev: {[len(s.layers) for s in gd.segments]}) max_len={gd.max_len}", flush=True)
 first, pos = gd.prime(ids)
 ok = gd.verify(int(np.argmax(first)), pos)
 print(f"graph bit-exact vs eager: {ok}", flush=True)

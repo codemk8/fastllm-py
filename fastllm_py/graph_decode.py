@@ -118,25 +118,39 @@ class _Segment:
         self.ws_list = []   # per-Marlin-call-site workspaces (see _mm)
         self.ws_i = 0
         self._pool = None
-
-        H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+        self._decoder = decoder
+        cp = decoder.cp
+        cfg = decoder.cfg
         hidden, dt = cfg.hidden_dim, decoder.dtype
         with cp.cuda.Device(dev_id):
             self.stream = cp.cuda.Stream(non_blocking=True)
             self.x_in = cp.zeros((1, hidden), dtype=dt)      # segment input hidden
             self.pos_idx = cp.zeros((1,), dtype=cp.int32)
-            self.bias = cp.full((decoder.max_len,), -1e30, dtype=cp.float32)
             self.hidden_out = cp.zeros((hidden,), dtype=dt)  # segment output hidden
-            self.k_cache = [cp.zeros((decoder.max_len, KVH, D), dtype=dt)
-                            for _ in layers]
-            self.v_cache = [cp.zeros((decoder.max_len, KVH, D), dtype=dt)
-                            for _ in layers]
-            cos, sin = decoder.model._rope_cache(cp.arange(decoder.max_len), D, cp)
+        self.alloc(decoder.max_len)
+
+    def alloc(self, max_len: int):
+        """(Re)allocate the max_len-sized buffers. Attention is O(max_len) per
+        token (it scans the whole bias-masked buffer), so sizing max_len to the
+        actual sequence — not a fixed large default — is a big win for wide
+        models. Called on construction and by GraphDecoder.resize()."""
+        cp = self._decoder.cp
+        cfg = self._decoder.cfg
+        H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
+        dt = self._decoder.dtype
+        self.max_len = max_len
+        self.graph = None          # invalidate any prior capture
+        self.ws_list, self.ws_i = [], 0
+        with cp.cuda.Device(self.dev_id):
+            self.bias = cp.full((max_len,), -1e30, dtype=cp.float32)
+            self.k_cache = [cp.zeros((max_len, KVH, D), dtype=dt) for _ in self.layers]
+            self.v_cache = [cp.zeros((max_len, KVH, D), dtype=dt) for _ in self.layers]
+            cos, sin = self._decoder.model._rope_cache(cp.arange(max_len), D, cp)
             self.cos_tab, self.sin_tab = cos, sin
 
 
 class GraphDecoder:
-    def __init__(self, model, max_len: int = 2048):
+    def __init__(self, model, max_len: int = 256):
         import cupy as cp
 
         cfg = model.cfg
@@ -298,6 +312,23 @@ class GraphDecoder:
                 seg.stream.synchronize()
         self._captured = True
 
+    def resize(self, need: int, headroom: int = 64):
+        """Ensure the graph buffers hold at least `need` positions, sizing to a
+        bucket (next power of two) so growth re-captures at most log(N) times.
+        Attention cost is O(max_len)/token, so keeping max_len tight matters —
+        especially for wide models (the 67B is 0.5x eager at max_len=2048 but
+        1.3x at max_len~=need). Re-allocates + re-captures if grown."""
+        target = 1
+        while target < need + headroom:
+            target *= 2
+        if target == self.max_len and self._captured:
+            return
+        self.max_len = target
+        for seg in self.segments:
+            seg.alloc(target)
+        self._captured = False
+        self.capture()
+
     # ------------------------------------------------------------- stepping
     def _run(self, token_id, position, graph: bool):
         """One decode token across all segments; returns logits (numpy).
@@ -399,7 +430,9 @@ class GraphDecoder:
     # ------------------------------------------------------------- generate
     def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = True,
                  verify: bool = True):
-        if use_graph and not self._captured:
+        if use_graph:
+            self.resize(len(prompt_ids) + max_new_tokens)  # tight max_len (+capture)
+        elif not self._captured:
             self.capture()
         first, pos = self.prime(prompt_ids)
         step = self.step if use_graph else self.step_eager

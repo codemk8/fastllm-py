@@ -65,9 +65,12 @@ def _expert_ffn_marlin(x_fp16, w, workspaces):
 
     def mm(proj, inp):
         size_n = w[f"{proj}.scales"].shape[1]
+        # sync=False: the caller's compute_stream.synchronize() (once per
+        # MoE layer) provides ordering; a per-GEMM deviceSynchronize would
+        # serialize ~288 stalls per decode token
         return marlin.marlin_gemm_int4(
             inp, w[f"{proj}.qweight"], w[f"{proj}.scales"], w[f"{proj}.zeros"],
-            workspaces[size_n], size_n=size_n)
+            workspaces[size_n], size_n=size_n, sync=False)
 
     g = mm("gate", x_fp16)
     u = mm("up", x_fp16)
@@ -106,11 +109,15 @@ class MoELayer:
         self.compute_stream = cp.cuda.Stream()
 
     # ---- device-side helpers -------------------------------------------
-    def _gpu_expert_weights(self, eid: int):
-        key = (self.layer_idx, eid)
+    def _payload_source(self, eid: int):
+        """What gets uploaded for expert eid: marlin payload or fp16 dict."""
         if self.gpu_payloads is not None:
-            return self.cache.get_or_upload(key, lambda: self.gpu_payloads[eid])
-        return self.cache.get_or_upload(key, lambda: self._materialize_cpu(eid))
+            return lambda: self.gpu_payloads[eid]
+        return lambda: self._materialize_cpu(eid)
+
+    def _gpu_expert_weights(self, eid: int):
+        return self.cache.get_or_upload((self.layer_idx, eid),
+                                        self._payload_source(eid))
 
     def _workspace(self, size_n: int):
         if size_n not in self._workspaces:
@@ -168,7 +175,7 @@ class MoELayer:
             eid = int(eid)
             key = (self.layer_idx, eid)
             if key not in self.cache:
-                self.cache.prefetch(key, lambda e=eid: self._materialize_cpu(e))
+                self.cache.prefetch(key, self._payload_source(eid))
 
     # ---- forward --------------------------------------------------------
     def forward(self, x):

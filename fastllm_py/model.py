@@ -71,22 +71,47 @@ _QUANT_SUFFIXES = (
 )
 
 
-@dataclass
 class KVCache:
-    k: object = None  # (T, kv_heads, head_dim)
-    v: object = None
+    """Capacity-doubling KV buffer: appends are amortized O(1) instead of
+    the O(T) copy that xp.concatenate does every decode step."""
+
+    __slots__ = ("_kbuf", "_vbuf", "_len")
+
+    def __init__(self):
+        self._kbuf = None
+        self._vbuf = None
+        self._len = 0
 
     def append(self, k_new, v_new, xp):
-        if self.k is None:
-            self.k, self.v = k_new, v_new
-        else:
-            self.k = xp.concatenate([self.k, k_new], axis=0)
-            self.v = xp.concatenate([self.v, v_new], axis=0)
-        return self.k, self.v
+        n = k_new.shape[0]
+        need = self._len + n
+        if self._kbuf is None or need > self._kbuf.shape[0]:
+            cap = 16 if self._kbuf is None else self._kbuf.shape[0]
+            while cap < need:
+                cap *= 2
+            kbuf = xp.empty((cap,) + k_new.shape[1:], dtype=k_new.dtype)
+            vbuf = xp.empty((cap,) + v_new.shape[1:], dtype=v_new.dtype)
+            if self._len:
+                kbuf[: self._len] = self._kbuf[: self._len]
+                vbuf[: self._len] = self._vbuf[: self._len]
+            self._kbuf, self._vbuf = kbuf, vbuf
+        self._kbuf[self._len : need] = k_new
+        self._vbuf[self._len : need] = v_new
+        self._len = need
+        return self._kbuf[:need], self._vbuf[:need]
 
     @property
     def seq_len(self):
-        return 0 if self.k is None else self.k.shape[0]
+        return self._len
+
+    # kept for callers/tests that read the raw tensors
+    @property
+    def k(self):
+        return None if self._kbuf is None else self._kbuf[: self._len]
+
+    @property
+    def v(self):
+        return None if self._vbuf is None else self._vbuf[: self._len]
 
 
 @dataclass

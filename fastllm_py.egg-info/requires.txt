@@ -1,0 +1,15 @@
+numpy
+cupy-cuda12x
+safetensors
+transformers>=4.51
+huggingface_hub
+
+[dev]
+pytest
+torch
+accelerate
+
+[serve]
+fastapi
+uvicorn
+flashinfer-python

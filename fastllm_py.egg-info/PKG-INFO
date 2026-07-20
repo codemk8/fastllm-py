@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: fastllm-py
+Version: 0.1.0
+Summary: Python-native hybrid CPU/GPU MoE inference engine (CuPy + NumPy + asyncio), porting fastllm's inference strategy
+Requires-Python: >=3.11
+Requires-Dist: numpy
+Requires-Dist: cupy-cuda12x
+Requires-Dist: safetensors
+Requires-Dist: transformers>=4.51
+Requires-Dist: huggingface_hub
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: torch; extra == "dev"
+Requires-Dist: accelerate; extra == "dev"
+Provides-Extra: serve
+Requires-Dist: fastapi; extra == "serve"
+Requires-Dist: uvicorn; extra == "serve"
+Requires-Dist: flashinfer-python; extra == "serve"

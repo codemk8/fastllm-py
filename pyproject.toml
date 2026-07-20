@@ -1,0 +1,22 @@
+[project]
+name = "fastllm-py"
+version = "0.1.0"
+description = "Python-native hybrid CPU/GPU MoE inference engine (CuPy + NumPy + asyncio), porting fastllm's inference strategy"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "cupy-cuda12x",
+    "safetensors",
+    "transformers>=4.51",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "torch", "accelerate"]
+serve = ["fastapi", "uvicorn", "flashinfer-python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["fastllm_py", "fastllm_py.kernels"]

@@ -1,0 +1,56 @@
+"""Core elementwise ops, written once and usable from NumPy or CuPy.
+
+Correctness-first implementations. Fused CuPy RawKernel variants can be
+substituted later without changing call sites.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+
+def get_xp(x):
+    return np if isinstance(x, np.ndarray) else __import__("cupy")
+
+
+def rmsnorm(x, weight, eps: float):
+    """x: (..., dim). Computed in fp32 like HF does."""
+    xp = get_xp(x)
+    xf = x.astype(xp.float32)
+    var = xp.mean(xf * xf, axis=-1, keepdims=True)
+    out = xf * (1.0 / xp.sqrt(var + eps))
+    return (out * weight.astype(xp.float32)).astype(x.dtype)
+
+
+def build_rope_cache(positions, head_dim: int, theta: float, xp=np):
+    """positions: (T,) int array -> cos/sin (T, head_dim//2) float32."""
+    inv_freq = 1.0 / (theta ** (xp.arange(0, head_dim, 2, dtype=xp.float32) / head_dim))
+    ang = positions.astype(xp.float32)[:, None] * inv_freq[None, :]
+    return xp.cos(ang), xp.sin(ang)
+
+
+def apply_rope(q, cos, sin):
+    """q: (T, heads, head_dim), HF 'rotate_half' convention:
+    pairs are (x[i], x[i + dim/2])."""
+    xp = get_xp(q)
+    half = q.shape[-1] // 2
+    qf = q.astype(xp.float32)
+    q1, q2 = qf[..., :half], qf[..., half:]
+    c = cos[:, None, :]
+    s = sin[:, None, :]
+    out = xp.concatenate([q1 * c - q2 * s, q2 * c + q1 * s], axis=-1)
+    return out.astype(q.dtype)
+
+
+def swiglu(gate, up):
+    """silu(gate) * up, in fp32."""
+    xp = get_xp(gate)
+    g = gate.astype(xp.float32)
+    return ((g / (1.0 + xp.exp(-g))) * up.astype(xp.float32)).astype(gate.dtype)
+
+
+def softmax(x, axis=-1):
+    xp = get_xp(x)
+    xf = x.astype(xp.float32)
+    m = xp.max(xf, axis=axis, keepdims=True)
+    e = xp.exp(xf - m)
+    return e / xp.sum(e, axis=axis, keepdims=True)

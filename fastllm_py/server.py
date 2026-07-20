@@ -11,7 +11,7 @@ import time
 import uuid
 
 from .device_router import DeviceMap, MoeDeviceMap
-from .engine import AsyncEngine, GenRequest
+from .engine import AsyncEngine, ContinuousEngine, GenRequest
 from .model import Model
 
 try:
@@ -112,6 +112,11 @@ def main():
                    help="quantize dense linears to INT4 (enables CUDA-graph decode)")
     p.add_argument("--no-cuda-graph", action="store_true",
                    help="disable CUDA-graph decode even for INT4 dense models")
+    p.add_argument("--continuous", action="store_true",
+                   help="continuous batching (many concurrent streams; greedy; "
+                        "needs --linear-quant int4)")
+    p.add_argument("--max-batch", type=int, default=16,
+                   help="max concurrent sequences for --continuous")
     args = p.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -133,11 +138,18 @@ def main():
 
     @app.on_event("startup")
     async def _start():
-        eng = AsyncEngine(model, cuda_graph=not args.no_cuda_graph)
-        STATE["engine"] = eng
-        await eng.start()
-        print(f"[fastllm] decode path: "
-              f"{'cuda_graph' if eng.gd is not None else 'eager'}")
+        if args.continuous:
+            eng = ContinuousEngine(model, max_batch=args.max_batch)
+            await eng.start()
+            STATE["engine"] = eng
+            print(f"[fastllm] decode path: continuous_batch "
+                  f"(max_batch={args.max_batch})")
+        else:
+            eng = AsyncEngine(model, cuda_graph=not args.no_cuda_graph)
+            STATE["engine"] = eng
+            await eng.start()
+            print(f"[fastllm] decode path: "
+                  f"{'cuda_graph' if eng.gd is not None else 'eager'}")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

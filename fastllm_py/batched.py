@@ -276,15 +276,19 @@ class BatchedDecoder:
 
     def set_slot(self, slot, kvs, n):
         """Load one sequence's prefill KV into a slot and set its position, for
-        continuous batching (reuse a captured decoder across requests). Runs on
-        self.stream so the writes are ordered before the next graph step."""
+        continuous batching (reuse a captured decoder across requests).
+
+        The copy runs on the DEFAULT stream — same stream the prefill
+        (model.forward) produced `kvs` on — so it's ordered after it (copying on
+        self.stream instead races the still-running prefill). The final device
+        sync makes the writes visible to self.stream before the next graph."""
         cp = self.cp
-        with cp.cuda.Device(self.dev), self.stream:
+        with cp.cuda.Device(self.dev):
             for li in range(len(self.model.layers)):
                 self.k_cache[li][slot, :n] = kvs[li].k.astype(self.dtype)
                 self.v_cache[li][slot, :n] = kvs[li].v.astype(self.dtype)
             self.pos[slot] = n - 1
-        self.stream.synchronize()
+            cp.cuda.Device(self.dev).synchronize()
 
     def _rope(self, t, cos, sin, nheads, D):
         """t: (B, nheads, D); cos/sin: (B, D/2) -> half-split rotate."""

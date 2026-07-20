@@ -136,3 +136,73 @@ class AsyncEngine:
         finally:
             emit(None)  # sentinel
             loop.call_soon_threadsafe(req.done.set)
+
+
+class ContinuousEngine:
+    """Async front-end for continuous batching (fastllm_py.batched.BatchedEngine).
+
+    A background thread runs the batching scheduler; tokens stream back to each
+    request's asyncio.Queue via the event loop. Greedy decoding only (batched
+    sampling is a TODO) — matches each request's single-stream greedy output.
+    Drop-in for AsyncEngine's submit()/GenRequest interface, used by the server
+    with --continuous. Requires a graph-capable model (INT4 dense, 1 GPU).
+    """
+
+    def __init__(self, model: Model, max_batch: int = 16, max_len: int = 4096):
+        import queue as _queue
+
+        from .batched import BatchedEngine
+        from .graph_decode import graph_capable
+
+        if not graph_capable(model):
+            raise ValueError("ContinuousEngine needs a graph-capable model "
+                             "(INT4 dense, single GPU)")
+        self.be = BatchedEngine(model, max_batch=max_batch, max_len=max_len)
+        self.incoming = _queue.Queue()
+        self.loop = None
+        self._thread = None
+
+    async def start(self):
+        import threading
+
+        self.loop = asyncio.get_running_loop()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    async def submit(self, req: GenRequest) -> GenRequest:
+        self.incoming.put(req)
+        return req
+
+    def _wire(self, req: GenRequest):
+        loop = self.loop
+        t0 = time.time()
+
+        def on_token(tok):
+            loop.call_soon_threadsafe(req.queue.put_nowait, tok)
+
+        def on_done():
+            req.stats = {"completion_tokens": None,
+                         "decode_path": "continuous_batch"}
+            loop.call_soon_threadsafe(req.queue.put_nowait, None)  # sentinel
+            loop.call_soon_threadsafe(req.done.set)
+
+        self.be.submit(req.token_ids, req.max_new_tokens, req.stop_token_ids,
+                       on_token=on_token, on_done=on_done)
+
+    def _run(self):
+        import queue as _queue
+
+        while True:
+            drained = False
+            try:
+                while True:
+                    self._wire(self.incoming.get_nowait())
+                    drained = True
+            except _queue.Empty:
+                pass
+            if self.be.step():          # ran a batch step (active work)
+                continue
+            if drained:                 # just submitted; loop to slot them
+                continue
+            # fully idle — block until the next request arrives (no busy spin)
+            self._wire(self.incoming.get())

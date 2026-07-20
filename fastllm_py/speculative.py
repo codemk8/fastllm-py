@@ -29,7 +29,8 @@ def _argmax_last(logits, xp_asnumpy):
 
 
 class SpeculativeDecoder:
-    def __init__(self, target: Model, draft: Model, gamma: int = 4):
+    def __init__(self, target: Model, draft: Model, gamma: int = 4,
+                 draft_graph: bool = True, draft_max_len: int = 4096):
         if target.cfg.vocab_size != draft.cfg.vocab_size:
             raise ValueError("target and draft must share a vocabulary")
         self.target = target
@@ -39,12 +40,30 @@ class SpeculativeDecoder:
 
         self._np = lambda a: cp.asnumpy(a) if isinstance(a, cp.ndarray) else np.asarray(a)
 
+        # graph-accelerate the draft rollout (the hot loop): gamma cheap
+        # single-token steps per round is exactly GraphDecoder's best case.
+        self.draft_gd = None
+        if draft_graph:
+            try:
+                from .graph_decode import GraphDecoder, graph_capable
+
+                if graph_capable(draft):
+                    gd = GraphDecoder(draft, max_len=draft_max_len)
+                    gd.capture()
+                    self.draft_gd = gd
+            except Exception:
+                self.draft_gd = None
+
     def generate(self, prompt_ids, max_new_tokens: int = 128):
         np_ = self._np
         ids = np.asarray(prompt_ids, dtype=np.int64)
 
         t_log, t_kv = self.target.forward(ids)
-        d_log, d_kv = self.draft.forward(ids)
+        if self.draft_gd is not None:
+            self.draft_gd.prime(ids)       # fills the draft graph's KV buffers
+            d_kv = None
+        else:
+            d_log, d_kv = self.draft.forward(ids)
         P = len(ids)                       # committed length in both KV caches
         cur = _argmax_last(t_log, np_)     # first target token (position P)
         out = [cur]
@@ -55,11 +74,16 @@ class SpeculativeDecoder:
             self.stats["rounds"] += 1
             g = min(self.gamma, max_new_tokens - len(out))
 
-            # 1. draft rollout: forward cur, t1, ..., t_{g-1}; propose t1..tg
-            proposals, x = [], cur
+            # 1. draft rollout: from cur, propose g tokens (writes cur..t_{g-1})
+            proposals, x, dpos = [], cur, P
             for _ in range(g):
-                d_log, d_kv = self.draft.forward(np.array([x]), d_kv)
-                x = _argmax_last(d_log, np_)
+                if self.draft_gd is not None:
+                    dl = self.draft_gd.step(x, dpos)
+                    x = int(np.argmax(dl))
+                else:
+                    d_log, d_kv = self.draft.forward(np.array([x]), d_kv)
+                    x = _argmax_last(d_log, np_)
+                dpos += 1
                 proposals.append(x)
             self.stats["proposed"] += g
 
@@ -89,8 +113,11 @@ class SpeculativeDecoder:
             out.extend(emit)
             for c in t_kv:
                 c.truncate(keep)
-            for c in d_kv:
-                c.truncate(keep)
+            if self.draft_gd is not None:
+                self.draft_gd.truncate(keep)
+            else:
+                for c in d_kv:
+                    c.truncate(keep)
             P = keep
 
         return out[:max_new_tokens]

@@ -307,6 +307,16 @@ class GraphDecoder:
         last.stream.synchronize()  # the one and only host sync per token
         return cp.asnumpy(logits)
 
+    def truncate(self, keep: int):
+        """Roll the KV back to `keep` valid positions by re-masking the rest
+        (the cached rows past `keep` become stale but masked, and are
+        overwritten by the next step). Used by speculative decoding."""
+        cp = self.cp
+        for seg in self.segments:
+            with cp.cuda.Device(seg.dev_id), seg.stream:
+                seg.bias[keep:] = -1e30
+            seg.stream.synchronize()
+
     def step(self, token_id, position):
         return self._run(token_id, position, graph=True)
 

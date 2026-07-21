@@ -336,10 +336,10 @@ def _attn_decode_kernel(cp, ctype: str):
         _ATTN_DECODE[key] = cp.RawKernel(rf"""
         #include <cuda_fp16.h>
         extern "C" __global__ void attn_decode_{ctype.replace(' ', '_')}(
-                const float* __restrict__ q,       // (H, D) fp32
+                const {ctype}* __restrict__ q,     // (H, D) activation dtype
                 const {ctype}* __restrict__ kc,    // (max_len, KVH, D)
                 const {ctype}* __restrict__ vc,    // (max_len, KVH, D)
-                float* __restrict__ out,           // (H, D) fp32
+                {ctype}* __restrict__ out,         // (H, D) activation dtype
                 const int* __restrict__ pos,       // device scalar; valid = pos[0]+1
                 int H, int KVH, int D, float scale) {{
             int h = blockIdx.x, tid = threadIdx.x, BLK = blockDim.x;
@@ -348,7 +348,7 @@ def _attn_decode_kernel(cp, ctype: str):
             float* sq = sh;                        // D
             float* scores = sh + D;                // VL (<= max_len)
             float* red = scores + VL;              // BLK
-            for (int i = tid; i < D; i += BLK) sq[i] = q[h * D + i];
+            for (int i = tid; i < D; i += BLK) sq[i] = (float)q[h * D + i];
             __syncthreads();
             // (1) scores[j] = dot(q, k_j) * scale
             for (int j = tid; j < VL; j += BLK) {{
@@ -373,7 +373,7 @@ def _attn_decode_kernel(cp, ctype: str):
             for (int d = tid; d < D; d += BLK) {{
                 float acc = 0.0f;
                 for (int j = 0; j < VL; j++) acc += scores[j] * (float)vc[((long long)j * KVH + kvh) * D + d];
-                out[h * D + d] = acc / l;
+                out[h * D + d] = ({ctype})(acc / l);
             }}
         }}""", f"attn_decode_{ctype.replace(' ', '_')}")
     return _ATTN_DECODE[key]
@@ -763,14 +763,17 @@ class GraphDecoder:
             # kernel — one block per head, `_ABLK` threads; shared holds the
             # query (D), the per-key scores (up to max_len), and a reduction
             # scratch (_ABLK).
-            qh = cp.ascontiguousarray(q.reshape(H, D).astype(cp.float32))
-            ctx = cp.empty((H, D), dtype=cp.float32)
+            # q is already the activation dtype (fp16) from _rope; the kernel
+            # accumulates in fp32 internally, so no up/down-convert is needed —
+            # feed q and receive ctx both in the activation dtype.
+            qh = cp.ascontiguousarray(q.reshape(H, D))
+            ctx = cp.empty((H, D), dtype=self.dtype)
             _ABLK = 128
             attn((H,), (_ABLK,), (qh, kc, vc, ctx, seg.pos_idx,
                                   np.int32(H), np.int32(KVH), np.int32(D),
                                   np.float32(scale)),
                  shared_mem=(D + self.max_len + _ABLK) * 4)
-            ctx = ctx.reshape(1, H * D).astype(self.dtype)
+            ctx = ctx.reshape(1, H * D)
             x = x + lin(layer, "self_attn.o_proj", ctx)
 
             h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)

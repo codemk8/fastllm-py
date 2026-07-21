@@ -250,7 +250,7 @@ def _route_topk_kernel(cp):
         _ROUTE_TOPK = cp.RawKernel(r"""
         extern "C" __global__ void route_topk(
                 const float* __restrict__ logits, float* __restrict__ rw,
-                int E, int K, int norm, float scale) {
+                int* __restrict__ aidx, int E, int K, int norm, float scale) {
             int tid = threadIdx.x, nt = blockDim.x;
             extern __shared__ float sh[];          // pr[E] + red[nt]
             float* pr = sh; float* red = sh + E;
@@ -277,7 +277,8 @@ def _route_topk_kernel(cp):
             for (int i = tid; i < E; i += nt) {
                 float pi = pr[i]; int c = 0;
                 for (int j = 0; j < E; j++) c += (pr[j] > pi);
-                rw[i] = (c < K) ? (pi / denom) * scale : 0.0f;
+                if (c < K) { rw[i] = (pi / denom) * scale; aidx[c] = i; }
+                else rw[i] = 0.0f;
             }
         }
         """, "route_topk")
@@ -592,6 +593,9 @@ class GraphDecoder:
             self._moe_lbuf = cp.empty((E,), dtype=cp.float32)
             self._moe_ibuf = cp.empty((E, inter), dtype=cp.float32)
             self._moe_rw = cp.empty((E,), dtype=cp.float32)
+            # compact active-expert index list (route_topk fills it) -> the MoE
+            # kernels launch grid.y=K over these, not E=128 with 120 early-out
+            self._moe_aidx = cp.zeros((cfg.num_experts_per_tok,), dtype=cp.int32)
             self._moe_out = cp.empty((cfg.hidden_dim,), dtype=cp.float32)
             self._moe_srw = cp.ones((1,), dtype=cp.float32)
             self._moe_sout = cp.empty((cfg.hidden_dim,), dtype=cp.float32)
@@ -676,14 +680,14 @@ class GraphDecoder:
         moe_int4.gate_matvec(xr, gm["gate_w"], M["E"], cfg.hidden_dim, out=self._moe_lbuf)
         E = M["E"]
         _route_topk_kernel(cp)((1,), (128,),
-            (self._moe_lbuf, self._moe_rw, np.int32(E),
+            (self._moe_lbuf, self._moe_rw, self._moe_aidx, np.int32(E),
              np.int32(cfg.num_experts_per_tok),
              np.int32(1 if cfg.norm_topk_prob else 0),
              np.float32(cfg.routed_scaling_factor)),
             shared_mem=(E + 128) * 4)
         moe_int4.fused_moe_weighted(xr, gm["stacked"], self._moe_rw, M["E"],
                                     cfg.hidden_dim, M["inter"], out=self._moe_out,
-                                    inter_buf=self._moe_ibuf)
+                                    inter_buf=self._moe_ibuf, aidx=self._moe_aidx)
         if gm["shared"] is not None:
             moe_int4.fused_moe_weighted(xr, gm["shared"], self._moe_srw, 1,
                                         cfg.hidden_dim, M["sinter"], out=self._moe_sout,

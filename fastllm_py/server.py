@@ -47,6 +47,11 @@ async def chat_completions(body: dict):
         max_new_tokens=int(body.get("max_tokens") or 512),
         temperature=float(body.get("temperature") or 0.0),
         top_p=float(body.get("top_p") or 1.0),
+        top_k=int(body.get("top_k") or 0),
+        min_p=float(body.get("min_p") or 0.0),
+        repetition_penalty=float(body.get("repetition_penalty") or 1.0),
+        frequency_penalty=float(body.get("frequency_penalty") or 0.0),
+        presence_penalty=float(body.get("presence_penalty") or 0.0),
         stop_token_ids=tuple(STATE["stop_ids"]),
     )
     await engine.submit(req)

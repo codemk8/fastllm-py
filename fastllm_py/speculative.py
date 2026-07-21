@@ -77,7 +77,7 @@ class SpeculativeDecoder:
 
     def generate(self, prompt_ids, max_new_tokens: int = 128, stop_ids=None,
                  on_token=None, temperature: float = 0.0, top_p: float = 1.0,
-                 top_k: int = 0, seed=None):
+                 top_k: int = 0, seed=None, min_p: float = 0.0):
         """Speculative decode. temperature<=0 is greedy (output identical to
         greedy target decoding); temperature>0 uses rejection sampling (Leviathan
         et al. / Chen et al.) so the output distribution is exactly the target's
@@ -92,7 +92,7 @@ class SpeculativeDecoder:
         rng = np.random.default_rng(seed) if sampling else None
 
         def _tprobs(logits_row):
-            return logits_to_probs(logits_row, temperature, top_p, top_k)
+            return logits_to_probs(logits_row, temperature, top_p, top_k, min_p)
 
         def _pick(logits_row):  # target/draft token draw (last-row logits)
             if not sampling:

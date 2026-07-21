@@ -1,7 +1,7 @@
 """Unit tests for the shared token sampler (pure numpy, no GPU)."""
 import numpy as np
 
-from fastllm_py.graph_decode import sample_logits
+from fastllm_py.graph_decode import apply_penalties, logits_to_probs, sample_logits
 
 
 def _logits(vocab=50, peak=None, seed=0):
@@ -56,3 +56,44 @@ def test_distribution_matches_softmax():
     for _ in range(N):
         counts[sample_logits(lg, temperature=1.0, rng=rng)] += 1
     assert np.allclose(counts / N, probs, atol=0.02)
+
+
+def test_min_p_prunes_low_prob_tokens():
+    # one dominant token; min_p should drop everything far below the peak
+    lg = np.array([5.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    probs = logits_to_probs(lg, temperature=1.0, min_p=0.5)
+    assert probs[0] == 1.0 and probs[1:].sum() == 0.0
+
+
+def test_repetition_penalty_lowers_seen_token():
+    lg = np.array([2.0, 2.0, 2.0], dtype=np.float32)
+    out = apply_penalties(lg, {0: 1}, repetition_penalty=2.0)
+    assert out[0] < out[1]  # seen positive logit divided down
+    # negative logits are multiplied (pushed further down)
+    lg2 = np.array([-1.0, 1.0], dtype=np.float32)
+    out2 = apply_penalties(lg2, {0: 1}, repetition_penalty=2.0)
+    assert out2[0] == -2.0
+
+
+def test_frequency_and_presence_penalty():
+    lg = np.zeros(3, dtype=np.float32)
+    out = apply_penalties(lg, {0: 3, 1: 1}, frequency_penalty=0.5,
+                          presence_penalty=1.0)
+    assert np.isclose(out[0], -(0.5 * 3 + 1.0))   # freq*count + presence
+    assert np.isclose(out[1], -(0.5 * 1 + 1.0))
+    assert out[2] == 0.0                            # unseen untouched
+
+
+def test_penalties_noop_when_default():
+    lg = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    assert apply_penalties(lg, {0: 5}) is lg        # no penalty set -> identity
+    assert apply_penalties(lg, {}, repetition_penalty=2.0) is lg  # empty counts
+
+
+def test_repetition_penalty_makes_repeat_less_likely():
+    # a token that's already dominant becomes less certain after penalty
+    lg = np.array([4.0, 3.9, 0.0], dtype=np.float32)
+    base = logits_to_probs(lg, temperature=1.0)
+    pen = logits_to_probs(apply_penalties(lg, {0: 1}, repetition_penalty=1.5),
+                          temperature=1.0)
+    assert pen[0] < base[0]

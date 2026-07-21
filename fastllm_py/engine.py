@@ -21,6 +21,11 @@ class GenRequest:
     max_new_tokens: int = 256
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
     stop_token_ids: tuple[int, ...] = ()
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)  # streamed ids
     done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -31,6 +36,22 @@ def _sample(logits: np.ndarray, temperature: float, top_p: float) -> int:
     from .graph_decode import sample_logits
 
     return sample_logits(logits, temperature, top_p)
+
+
+def _sample_req(logits, req: "GenRequest", counts: dict, rng) -> int:
+    """Full per-request sampler: generation penalties -> temperature/top-k/
+    min-p/top-p sampling. Maintains `counts` (generated-token histogram) in
+    place for the penalties."""
+    from .graph_decode import apply_penalties, sample_logits
+
+    if counts and (req.repetition_penalty != 1.0 or req.frequency_penalty != 0.0
+                   or req.presence_penalty != 0.0):
+        logits = apply_penalties(logits, counts, req.repetition_penalty,
+                                 req.frequency_penalty, req.presence_penalty)
+    tok = sample_logits(logits, req.temperature, req.top_p, req.top_k, rng,
+                        req.min_p)
+    counts[tok] = counts.get(tok, 0) + 1
+    return tok
 
 
 class AsyncEngine:
@@ -95,7 +116,13 @@ class AsyncEngine:
             produced = 0
             # speculative path: greedy (identical to greedy target) OR sampled
             # (rejection sampling preserves the target's sampling distribution).
-            use_spec = (self.spec is not None
+            # Generation penalties aren't modeled in the rejection step yet, so
+            # penalty requests fall back to the graph/eager path (which honors
+            # them).
+            no_penalty = (req.repetition_penalty == 1.0
+                          and req.frequency_penalty == 0.0
+                          and req.presence_penalty == 0.0)
+            use_spec = (self.spec is not None and no_penalty
                         and n_prompt + req.max_new_tokens < self.graph_max_len)
             use_graph = (not use_spec and self.gd is not None
                          and n_prompt + req.max_new_tokens < self.graph_max_len)
@@ -111,14 +138,17 @@ class AsyncEngine:
 
                 self.spec.generate(ids, max_new_tokens=req.max_new_tokens,
                                    stop_ids=req.stop_token_ids, on_token=_on,
-                                   temperature=req.temperature, top_p=req.top_p)
+                                   temperature=req.temperature, top_p=req.top_p,
+                                   top_k=req.top_k, min_p=req.min_p)
                 produced = state["n"]
                 t_prefill = state.get("t_prefill", time.time() - t0)
             elif use_graph:
+                counts: dict = {}
+                rng = (np.random.default_rng() if req.temperature > 0.0 else None)
                 last, pos = self.gd.prime(ids)
                 t_prefill = time.time() - t0
                 while produced < req.max_new_tokens:
-                    nxt = _sample(last, req.temperature, req.top_p)
+                    nxt = _sample_req(last, req, counts, rng)
                     produced += 1
                     emit(nxt)
                     if nxt in req.stop_token_ids:
@@ -126,13 +156,15 @@ class AsyncEngine:
                     last = self.gd.step(nxt, pos)
                     pos += 1
             else:
+                counts = {}
+                rng = (np.random.default_rng() if req.temperature > 0.0 else None)
                 logits, kvs = self.model.forward(ids, None)
                 t_prefill = time.time() - t0
                 while produced < req.max_new_tokens:
                     last = logits[-1]
                     if isinstance(last, cp.ndarray):
                         last = cp.asnumpy(last)
-                    nxt = _sample(last, req.temperature, req.top_p)
+                    nxt = _sample_req(last, req, counts, rng)
                     produced += 1
                     emit(nxt)
                     if nxt in req.stop_token_ids:

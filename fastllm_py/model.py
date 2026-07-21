@@ -470,10 +470,12 @@ class Model:
 
     def generate(self, token_ids, max_new_tokens: int = 32, temperature: float = 0.0,
                  use_graph: bool = True, stop_ids=None, top_p: float = 1.0,
-                 top_k: int = 0, seed=None):
+                 top_k: int = 0, seed=None, min_p: float = 0.0,
+                 repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                 presence_penalty: float = 0.0):
         import cupy as cp
 
-        from .graph_decode import sample_logits
+        from .graph_decode import apply_penalties, sample_logits
 
         ids = list(token_ids)
 
@@ -486,21 +488,32 @@ class Model:
             gd = self._get_graph_decoder()
             if gd is not None:
                 try:
-                    return gd.generate(np.asarray(ids, dtype=np.int64),
-                                       max_new_tokens=max_new_tokens, use_graph=True,
-                                       stop_ids=stop_ids, temperature=temperature,
-                                       top_p=top_p, top_k=top_k, seed=seed)
+                    return gd.generate(
+                        np.asarray(ids, dtype=np.int64),
+                        max_new_tokens=max_new_tokens, use_graph=True,
+                        stop_ids=stop_ids, temperature=temperature, top_p=top_p,
+                        top_k=top_k, seed=seed, min_p=min_p,
+                        repetition_penalty=repetition_penalty,
+                        frequency_penalty=frequency_penalty,
+                        presence_penalty=presence_penalty)
                 except Exception:
                     pass  # fall through to eager
 
         rng = np.random.default_rng(seed) if temperature > 0.0 else None
+        counts: dict = {}
+        penalized = (repetition_penalty != 1.0 or frequency_penalty != 0.0
+                     or presence_penalty != 0.0)
         logits, kvs = self.forward(np.asarray(ids))
         out = []
         for _ in range(max_new_tokens):
             last = logits[-1]
             if isinstance(last, cp.ndarray):
                 last = cp.asnumpy(last)
-            nxt = sample_logits(last, temperature, top_p, top_k, rng)
+            if penalized:
+                last = apply_penalties(last, counts, repetition_penalty,
+                                       frequency_penalty, presence_penalty)
+            nxt = sample_logits(last, temperature, top_p, top_k, rng, min_p)
+            counts[nxt] = counts.get(nxt, 0) + 1
             out.append(nxt)
             if stop_ids and nxt in stop_ids:
                 break

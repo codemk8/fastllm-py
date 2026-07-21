@@ -39,10 +39,33 @@ from .kernels.ops import apply_rope, rmsnorm, swiglu
 from .model import matmul_w
 
 
+def apply_penalties(logits, counts, repetition_penalty: float = 1.0,
+                    frequency_penalty: float = 0.0,
+                    presence_penalty: float = 0.0) -> np.ndarray:
+    """Return logits adjusted for previously generated tokens (a dict
+    token_id -> count). repetition_penalty is HF-style (divide positive logits,
+    multiply negative ones); frequency/presence are OpenAI-style (subtract
+    freq*count + presence*[seen]). No-op (returns input) when nothing is set or
+    counts is empty."""
+    if not counts or (repetition_penalty == 1.0 and frequency_penalty == 0.0
+                      and presence_penalty == 0.0):
+        return logits
+    lg = np.array(logits, dtype=np.float64, copy=True)
+    ids = np.fromiter(counts.keys(), dtype=np.int64, count=len(counts))
+    cnt = np.fromiter(counts.values(), dtype=np.float64, count=len(counts))
+    if repetition_penalty != 1.0:
+        sub = lg[ids]
+        lg[ids] = np.where(sub > 0, sub / repetition_penalty,
+                           sub * repetition_penalty)
+    if frequency_penalty != 0.0 or presence_penalty != 0.0:
+        lg[ids] -= frequency_penalty * cnt + presence_penalty
+    return lg
+
+
 def logits_to_probs(logits, temperature: float, top_p: float = 1.0,
-                    top_k: int = 0) -> np.ndarray:
+                    top_k: int = 0, min_p: float = 0.0) -> np.ndarray:
     """(vocab,) logits -> normalized probability vector after temperature scale,
-    optional top-k, and optional nucleus (top-p) truncation. temperature must be
+    optional top-k, min-p, and nucleus (top-p) truncation. temperature must be
     > 0. This is the sampling distribution both the plain sampler and
     speculative sampling draw from (so their transforms stay identical)."""
     lg = np.asarray(logits, dtype=np.float64) / temperature
@@ -52,6 +75,9 @@ def logits_to_probs(logits, temperature: float, top_p: float = 1.0,
     if top_k and 0 < top_k < probs.size:
         drop = np.argpartition(probs, -top_k)[:-top_k]
         probs[drop] = 0.0
+        probs /= probs.sum()
+    if min_p > 0.0:                    # keep tokens >= min_p * peak probability
+        probs[probs < min_p * probs.max()] = 0.0
         probs /= probs.sum()
     if top_p < 1.0:
         order = np.argsort(-probs)
@@ -64,14 +90,15 @@ def logits_to_probs(logits, temperature: float, top_p: float = 1.0,
 
 
 def sample_logits(logits, temperature: float = 0.0, top_p: float = 1.0,
-                  top_k: int = 0, rng=None) -> int:
+                  top_k: int = 0, rng=None, min_p: float = 0.0) -> int:
     """Pick a token id from a (vocab,) numpy logit vector. temperature<=0 is
-    greedy argmax; otherwise temperature-scale -> optional top-k -> optional
+    greedy argmax; otherwise temperature-scale -> optional top-k -> min-p ->
     nucleus (top-p) -> categorical sample. rng is an optional np.random.Generator
-    for reproducibility (falls back to the global RNG)."""
+    for reproducibility (falls back to the global RNG). Any generation penalties
+    should already be applied to `logits` (see apply_penalties)."""
     if temperature <= 0.0:
         return int(np.argmax(logits))
-    probs = logits_to_probs(logits, temperature, top_p, top_k)
+    probs = logits_to_probs(logits, temperature, top_p, top_k, min_p)
     return int((rng or np.random).choice(probs.size, p=probs))
 
 
@@ -604,7 +631,9 @@ class GraphDecoder:
     # ------------------------------------------------------------- generate
     def generate(self, prompt_ids, max_new_tokens: int = 32, use_graph: bool = True,
                  verify: bool = True, stop_ids=None, temperature: float = 0.0,
-                 top_p: float = 1.0, top_k: int = 0, seed=None):
+                 top_p: float = 1.0, top_k: int = 0, seed=None, min_p: float = 0.0,
+                 repetition_penalty: float = 1.0, frequency_penalty: float = 0.0,
+                 presence_penalty: float = 0.0):
         if use_graph:
             self.resize(len(prompt_ids) + max_new_tokens)  # tight max_len (+capture)
         elif not self._captured:
@@ -618,7 +647,18 @@ class GraphDecoder:
             step = self.step_eager
             self.graph_fellback = True
         rng = np.random.default_rng(seed) if temperature > 0.0 else None
-        pick = lambda lg: sample_logits(lg, temperature, top_p, top_k, rng)
+        counts: dict = {}
+        penalized = (repetition_penalty != 1.0 or frequency_penalty != 0.0
+                     or presence_penalty != 0.0)
+
+        def pick(lg):
+            if penalized:
+                lg = apply_penalties(lg, counts, repetition_penalty,
+                                     frequency_penalty, presence_penalty)
+            tok = sample_logits(lg, temperature, top_p, top_k, rng, min_p)
+            counts[tok] = counts.get(tok, 0) + 1
+            return tok
+
         out = [pick(first)]
         if stop_ids and out[-1] in stop_ids:
             return out

@@ -92,6 +92,48 @@ fused MoE; multi-GPU MoE graph; and the *offload* case (experts don't fit —
 671B) still needs prefetch/overlap on top of this. This is a working
 ktransformers-style lever end to end (fused kernel + graph capture).
 
+**Measured negative result (2026-07-20, Qwen3-30B/5090):** replacing the
+`(E,)`-weighted MoE kernel (launches E=128 blocks, 120 early-out) with the
+index-driven `fused_moe_ffn2` (K=8 blocks, via a capturable device argsort→top-K)
+gave **no end-to-end speedup** (82.6 vs 82.8 tok/s), though it stayed token-exact
+vs the marlin reference. Reason + lesson: the 4× kernel win was measured in
+**eager** mode where each launch pays Python/driver overhead; inside the
+**captured graph** that overhead is gone, so the 120 non-routed blocks just read
+`rw[e]` and retire for free. **Eager kernel latency mispredicts graph-replay
+cost** — profile inside the graph. At ~12 ms/token the work is spread evenly
+(attention + projections + MoE + norms), so 82.8 is near the roofline for our
+INT4 *CUDA-core* kernels; the real lever is tensor cores (§5), not MoE
+micro-opt. Change reverted to keep the weighted path.
+
+### 2a. GPU-accelerate `build_stacked_experts` (startup latency + host RAM)
+
+**Observed (Qwen3-30B-A3B, 5090, 2026-07-20):** graph-MoE prep after model load
+was **CPU-bound and slow** — VRAM climbed ~75 MB/s while GPU util sat at ~2% and
+one core ran ~65%, adding minutes of startup before the first decode. Cause:
+`build_stacked_experts` (`kernels/moe_int4.py`) is a Python loop over
+E×3 matrices — **48 layers × 128 experts × {gate,up,down} ≈ 18k**
+`quantize_int4_rowmajor` calls — and each does a host dequant(marlin-int4→fp16)
+→ requant(fp16→row-major-int4) round-trip, materializing all E fp16 expert
+matrices per layer on the host before `xp.stack`.
+
+**Investigate:**
+- **Do the restack on-GPU, batched over experts** — one kernel (or a few cupy
+  ops) that quantizes all E experts of a layer at once, instead of the 384
+  per-layer Python calls. Removes the launch/Python overhead and uses the idle
+  GPU.
+- **Skip the fp16 round-trip** — convert the *already-resident* marlin-tiled
+  INT4 directly to the row-major INT4 group layout on-device (a repack kernel),
+  never rebuilding fp16. Saves both compute and the transient host fp16 buffers.
+- **Lower host RAM** — build straight into the destination GPU tensors and
+  stream per-expert (or per-layer), so we never hold all E fp16 matrices host-
+  side. Helps the big-MoE / offload case where host RAM is the ceiling.
+- Bonus: cache the stacked payload to disk so warm starts skip the build
+  entirely.
+
+This is startup cost only (not decode tok/s), but it dominates time-to-first-
+token for resident-MoE and matters more as E and layer count grow (30B has 128
+experts vs Qwen1.5-MoE's 60).
+
 ## 3. FlashInfer paged attention + continuous batching
 
 Replace the naive fp32 `_sdpa` + per-sequence KV with FlashInfer varlen/paged
@@ -108,6 +150,79 @@ latent (`kv_lora_rank` + rope, ~576 B/token/layer vs ~100 KB). Caching the
 latent and expanding on the fly makes batch-32 KV essentially free for
 DeepSeek models and shrinks decode memory traffic. Changes the KV layout, so
 fold it into the FlashInfer work.
+
+# Strategic bets (2026-07-20, on the 5090/Blackwell box)
+
+These three are coupled: **tensor-core kernels** give speed *and* enable FP8/MXFP4
+precisions; **mixed-precision experts** free the VRAM that **long context** (128K–
+256K KV) needs. Plan them together.
+
+## 5. Native tensor-core kernels (Blackwell FP8 / MXFP4) — foundational
+
+**Why.** Apple-to-apple on Qwen3-30B-A3B (5090): our INT4 graph decode is ~0.37×
+ktransformers' FP8. The gap is *not* bandwidth (we read ¼ the bytes at INT4) —
+it's that **we never touch the tensor cores**. Marlin INT4 runs on Blackwell only
+via PTX-JIT (Ada SASS, not sm_120-tuned); our FP8 kernel (`kernels/fp8.py`) is a
+CUDA-core dequant GEMV. ktransformers uses native FP8 tensor-core GEMM. Leaving
+the sm_120 tensor cores idle caps us permanently.
+
+**Plan.**
+- Build **capturable** CUTLASS (3.x/4.x) GEMM kernels for sm_120: **FP8-E4M3** and
+  **MXFP4** (the native Blackwell 4-bit float ktransformers uses for DeepSeek-V4-
+  Flash), wrapped as RawKernels/graph-launchable — cuBLAS/cuBLASLt are rejected
+  during CUDA-graph capture, so we cannot just call them (this was the whole
+  reason INT4 Marlin exists on the decode path).
+- Cover both regimes: **decode GEMV (M=1–16)** for the fast path and **prefill
+  GEMM (large M)**. Tensor cores underutilize at M=1, so this compounds with
+  batched decode (`batched.py`) — B>1 fills the tiles.
+- A **tensor-core fused-MoE** variant (FP8/MXFP4 expert GEMMs) to replace the
+  custom CUDA-core `fused_moe_*` kernels in the graph path.
+- Retune all launch configs for sm_120 (170 SMs, larger register file, new
+  memory hierarchy) — the current configs were chosen for Ada/4090.
+- Deliverable: capturable FP8 + MXFP4 GEMM, benchmarked vs Marlin INT4 on the
+  5090; target ≥ ktransformers FP8 on Qwen3-30B. Links [[#2a]] (the fused-MoE
+  restack should emit the tensor-core layout directly).
+
+## 6. Long context — 128K then 256K (hard requirement)
+
+**Why.** 128K/256K is a must. Today we top out at the model's native window
+(Qwen3-30B = 40,960; no YaRN engaged) and the graph KV buffer is VRAM-bound.
+
+**Plan.**
+- **Wire Qwen3 YaRN** (`rope_scaling`) to extend past native 40K → 131072 (we
+  have YaRN for DeepSeek/MLA already; Qwen3 standard-RoPE is a small addition).
+- **KV memory is the wall.** Qwen3-30B KV = ~96 KB/token ⇒ 12.6 GB @128K, ~25 GB
+  @256K. Alongside INT4 weights (16 GB) that overflows 32 GB at 256K. Levers:
+  - **KV quantization** (INT8/FP8 KV cache) — 2–4× smaller KV, the cheapest win.
+  - **Paged KV** (no fragmentation, on-demand pages) — fold into the FlashInfer
+    work (§3); also unlocks long-context batching.
+  - **Compressed MLA KV** (§4) for DeepSeek — ~10× smaller/token, the natural
+    long-context arch.
+  - **KV offload to CPU** (host RAM 62 GB) for the very long tail, with prefetch.
+- **Chunked prefill** — process a 128K–256K prompt in bounded chunks so prefill
+  memory/compute doesn't spike.
+- **Attention cost** at 256K: flash-decode is O(valid_len) so correctness holds,
+  but per-token cost grows linearly — investigate sparse/streaming attention
+  (DeepSeek-V4 DSA-style) for the long tail. Links [[#7]] — the KV budget only
+  closes if weights shrink via mixed precision.
+
+## 7. Mixed-precision experts (the VRAM lever that unlocks long context)
+
+**Why.** Long context needs VRAM for KV; the way to free it is to shrink the
+weights below uniform-INT4 without losing quality. MoE routing is **skewed**, so
+spend bits where they matter. Example budget @256K on the 5090: KV ~25 GB ⇒
+weights must be <7 GB ⇒ needs aggressive, *selective* quantization.
+
+**Plan.**
+- **Frequency/sensitivity-tiered precision:** hot (often-routed) experts FP8/BF16,
+  cold experts INT4/FP4; router + attention + shared-expert kept higher-precision
+  (quantization-sensitive).
+- **Placement-tiered:** hot experts resident (FP8 via §5 tensor cores), cold
+  experts INT4 offloaded to CPU with prefetch (Task #11 offload work).
+- Fused MoE kernel must handle **mixed formats** — cleanest as a two-pass split
+  (tensor-core FP8 kernel over the hot subset + INT4 kernel over the cold subset)
+  rather than per-expert dispatch inside one kernel.
+- Depends on [[#5]] (FP8 tensor-core kernels) and enables [[#6]] (long context).
 
 ## Smaller, safe wins already banked (2026-07-20)
 

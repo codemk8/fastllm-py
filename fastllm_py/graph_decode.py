@@ -284,6 +284,38 @@ def _route_topk_kernel(cp):
     return _ROUTE_TOPK
 
 
+_ROPE_K: dict = {}
+
+
+def _rope_kernel(cp, ctype: str):
+    """Fused RoPE (HF rotate_half) in one kernel — replaces apply_rope's
+    astype(fp32) + 4 multiplies + 2 adds + concatenate + astype-back (~8
+    elementwise launches, a big slice of the decode 'soup'; nsys cupy_multiply
+    was entirely rope). One thread per (head, dim). cos/sin: (D/2,) fp32."""
+    if ctype not in _ROPE_K:
+        _ROPE_K[ctype] = cp.RawKernel(rf"""
+        #include <cuda_fp16.h>
+        extern "C" __global__ void rope(
+                const {ctype}* __restrict__ qin, const float* __restrict__ cs,
+                const float* __restrict__ sn, {ctype}* __restrict__ qout,
+                int nheads, int D) {{
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= nheads * D) return;
+            int d = idx % D, half = D >> 1, h = idx / D;
+            if (d < half) {{
+                float q1 = static_cast<float>(qin[idx]);
+                float q2 = static_cast<float>(qin[h * D + d + half]);
+                qout[idx] = ({ctype})(q1 * cs[d] - q2 * sn[d]);
+            }} else {{
+                int e = d - half;
+                float q2 = static_cast<float>(qin[idx]);
+                float q1 = static_cast<float>(qin[h * D + e]);
+                qout[idx] = ({ctype})(q2 * cs[e] + q1 * sn[e]);
+            }}
+        }}""", "rope")
+    return _ROPE_K[ctype]
+
+
 _ATTN_DECODE: dict = {}
 
 
@@ -635,6 +667,19 @@ class GraphDecoder:
                             "_ACT_CTYPE); a new op is emitting an unhandled dtype")
         return t if t.dtype == self.dtype else t.astype(self.dtype)
 
+    def _rope(self, x, cos, sin, nheads):
+        """Fused RoPE over x (…, nheads, D). cos/sin are (1, D/2) fp32 (the
+        precomputed table row for this position). Returns a new array."""
+        cp = self.cp
+        D = self.cfg.head_dim
+        ker = _rope_kernel(cp, self.ctype)
+        out = cp.empty_like(x)
+        n = nheads * D
+        ker(((n + 255) // 256,), (256,),
+            (x.reshape(-1), cos.ravel(), sin.ravel(), out.reshape(-1),
+             np.int32(nheads), np.int32(D)))
+        return out
+
     # ------------------------------------------------------------ per segment
     def _dgemv(self, seg, inp, payload, buf):
         """Dense row-major INT4 GEMV (warp-per-row, x staged in shared, shuffle
@@ -704,8 +749,8 @@ class GraphDecoder:
             if layer.has("self_attn.q_norm.weight"):
                 q = rmsnorm(q, layer.w["self_attn.q_norm.weight"], cfg.norm_eps)
                 k = rmsnorm(k, layer.w["self_attn.k_norm.weight"], cfg.norm_eps)
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
+            q = self._rope(q, cos, sin, H)
+            k = self._rope(k, cos, sin, KVH)
 
             kc, vc = seg.k_cache[li], seg.v_cache[li]
             # KV cache + write kernel are compute-dtype; coerce k/v (activations)

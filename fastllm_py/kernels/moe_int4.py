@@ -94,21 +94,42 @@ def _gemv_kernel(cp):
     return _GEMV
 
 
+def _quantize_int4_rowmajor_batched(W, group_size: int, xp):
+    """Batched RTN group INT4 over a (E, out, in) tensor — same numerics as
+    quantize_int4_rowmajor but for all E experts at once (a handful of GPU ops
+    instead of an E-long Python loop). Returns (qweight (E,out,in/2) uint8,
+    scales (E,out,in/gs) f16, zeros f16, (out,in))."""
+    Ex, out_f, in_f = W.shape
+    assert in_f % group_size == 0 and in_f % 2 == 0
+    g = W.astype(xp.float32).reshape(Ex, out_f, in_f // group_size, group_size)
+    wmin, wmax = g.min(3), g.max(3)
+    scale = (wmax - wmin) / 15.0
+    scale = xp.where(scale == 0, 1.0, scale).astype(xp.float32)
+    zero = xp.clip(xp.rint(-wmin / scale), 0, 15).astype(xp.float32)
+    q = xp.clip(xp.rint(g / scale[..., None] + zero[..., None]), 0, 15
+                ).astype(xp.uint8).reshape(Ex, out_f, in_f)
+    packed = (q[:, :, 0::2] | (q[:, :, 1::2] << 4)).astype(xp.uint8)
+    return (xp.ascontiguousarray(packed), scale.astype(xp.float16),
+            zero.astype(xp.float16), (out_f, in_f))
+
+
 def build_stacked_experts(expert_ws, group_size: int = 128, xp=np) -> dict:
     """Stack E experts' {gate,up,down} into contiguous INT4 tensors indexable by
     expert id (for the fused selective kernel). expert_ws: list of dicts of fp16
     (out,in) weight matrices. Returns per-proj {qweight (E,out,in/2), scales
-    (E,out,in/gs), zeros (E,out,in/gs)} plus dims."""
+    (E,out,in/gs), zeros (E,out,in/gs)} plus dims.
+
+    Quantization is **batched over all E experts on the GPU** — stack each proj
+    into one (E,out,in) tensor and quantize it in one shot (vs the old per-expert
+    Python loop of E*3 calls/layer, which dominated graph-MoE startup)."""
     out = {"group": group_size}
     for proj in ("gate", "up", "down"):
-        qs, ss, zs = [], [], []
-        for w in expert_ws:
-            p = quantize_int4_rowmajor(w[proj], group_size, xp=xp)
-            qs.append(p["qweight"]); ss.append(p["scales"]); zs.append(p["zeros"])
-            out[f"{proj}.shape"] = p["shape"]
-        out[f"{proj}.qweight"] = xp.ascontiguousarray(xp.stack(qs))
-        out[f"{proj}.scales"] = xp.ascontiguousarray(xp.stack(ss))
-        out[f"{proj}.zeros"] = xp.ascontiguousarray(xp.stack(zs))
+        stack = xp.asarray(np.stack([np.asarray(w[proj]) for w in expert_ws]))
+        qw, sc, ze, shp = _quantize_int4_rowmajor_batched(stack, group_size, xp)
+        out[f"{proj}.qweight"] = qw
+        out[f"{proj}.scales"] = sc
+        out[f"{proj}.zeros"] = ze
+        out[f"{proj}.shape"] = shp
     return out
 
 
@@ -152,72 +173,96 @@ _FUSEDW = None
 
 
 def _fusedw_kernels(cp):
-    """Like _fused2 but driven by an (E,) routing-WEIGHT vector instead of K
-    indices: grid over ALL E experts, each block early-outs if its weight is 0.
-    Fully capturable (fixed grid, no index extraction / D2H) and still selective
-    — non-routed experts read nothing past the weight check."""
+    """(E,)-routing-weight-driven selective MoE FFN kernels — grid over ALL E
+    experts, each block early-outs if its weight is 0 (fully capturable, no D2H).
+
+    Design (2026-07-20 rewrite, ~5x faster: 183->36us at Qwen3-30B shapes):
+      * the input vector is staged **once per block in shared memory** — the old
+        kernel re-read x from global for every one of ~6k output rows, and
+        streaming the weights through L1 evicted x, so it ran at ~5% of BW; now
+        each block loads x/inter once and reuses it for a TILE of rows;
+      * **warp-per-row with a shuffle reduction** (no __syncthreads in the dot);
+      * **vectorized 4-byte INT4 loads** (8 nibbles per load).
+    ROWS_PER_BLOCK (rpb) is a launch arg so the grid can be sized for occupancy."""
     global _FUSEDW
     if _FUSEDW is None:
         src = r"""
         #include <cuda_fp16.h>
-        __device__ __forceinline__ float row_dot(
+        // warp (32 lanes) dot-products one output row against `vec`; INT4 weights
+        // read 4 bytes (8 nibbles) at a time; result valid on lane 0.
+        __device__ __forceinline__ float wrd(
                 const unsigned char* qw, const __half* sc, const __half* ze,
-                int row, const float* vec, int in_f, int gs, int tid, int nt) {
+                int row, const float* vec, int in_f, int gs, int lane) {
             const unsigned char* wr = qw + (long long)row * (in_f / 2);
             const __half* s = sc + (long long)row * (in_f / gs);
             const __half* z = ze + (long long)row * (in_f / gs);
             float acc = 0.0f;
-            for (int i = tid * 2; i < in_f; i += nt * 2) {
-                int gi = i / gs; float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
-                unsigned char b = wr[i / 2];
-                acc += ((float)(b & 0xF) - zv) * sv * vec[i];
-                acc += ((float)(b >> 4) - zv) * sv * vec[i + 1];
+            for (int p = lane * 8; p < in_f; p += 32 * 8) {
+                int gi = p / gs; float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
+                unsigned int packed = *reinterpret_cast<const unsigned int*>(wr + (p >> 1));
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    unsigned char b = (packed >> (j * 8)) & 0xFF;
+                    acc += ((float)(b & 0xF) - zv) * sv * vec[p + 2 * j];
+                    acc += ((float)(b >> 4) - zv) * sv * vec[p + 2 * j + 1];
+                }
             }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
             return acc;
-        }
-        __device__ __forceinline__ float blk_reduce(float v, float* sh, int tid, int nt) {
-            sh[tid] = v; __syncthreads();
-            for (int s = nt >> 1; s > 0; s >>= 1) { if (tid < s) sh[tid] += sh[tid+s]; __syncthreads(); }
-            return sh[0];
         }
         extern "C" __global__ void moew_gate_up(
                 const float* __restrict__ x, const float* __restrict__ rw,
                 const unsigned char* gqw, const __half* gsc, const __half* gze,
                 const unsigned char* uqw, const __half* usc, const __half* uze,
-                float* __restrict__ inter, int hidden, int ninter, int gs) {
-            int e = blockIdx.y, r = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-            if (rw[e] == 0.0f) return;                       // non-routed: skip
+                float* __restrict__ inter, int hidden, int ninter, int gs, int rpb) {
+            int e = blockIdx.y; if (rw[e] == 0.0f) return;   // non-routed: skip
+            int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, nw = blockDim.x >> 5;
+            extern __shared__ float xs[];                    // hidden floats
+            for (int i = tid; i < hidden; i += blockDim.x) xs[i] = x[i];
+            __syncthreads();
             long long qb = (long long)e * ninter * (hidden / 2);
             long long sb = (long long)e * ninter * (hidden / gs);
-            extern __shared__ float sh[];
-            float g = blk_reduce(row_dot(gqw+qb, gsc+sb, gze+sb, r, x, hidden, gs, tid, nt), sh, tid, nt);
-            __syncthreads();
-            float u = blk_reduce(row_dot(uqw+qb, usc+sb, uze+sb, r, x, hidden, gs, tid, nt), sh, tid, nt);
-            if (tid == 0) inter[(long long)e * ninter + r] = (g / (1.0f + __expf(-g))) * u;
+            int tile = blockIdx.x * rpb;
+            for (int r = tile + wid; r < tile + rpb && r < ninter; r += nw) {
+                float g = wrd(gqw+qb, gsc+sb, gze+sb, r, xs, hidden, gs, lane);
+                float u = wrd(uqw+qb, usc+sb, uze+sb, r, xs, hidden, gs, lane);
+                if (lane == 0) inter[(long long)e*ninter + r] = (g/(1.0f+__expf(-g)))*u;
+            }
         }
         extern "C" __global__ void moew_down(
                 const float* __restrict__ inter, const float* __restrict__ rw,
                 const unsigned char* dqw, const __half* dsc, const __half* dze,
-                float* __restrict__ out, int hidden, int ninter, int gs) {
-            int e = blockIdx.y, o = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-            float w = rw[e];
-            if (w == 0.0f) return;
+                float* __restrict__ out, int hidden, int ninter, int gs, int rpb) {
+            int e = blockIdx.y; float w = rw[e]; if (w == 0.0f) return;
+            int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, nw = blockDim.x >> 5;
+            extern __shared__ float is[];                    // ninter floats
+            const float* iv = inter + (long long)e * ninter;
+            for (int i = tid; i < ninter; i += blockDim.x) is[i] = iv[i];
+            __syncthreads();
             long long qb = (long long)e * hidden * (ninter / 2);
             long long sb = (long long)e * hidden * (ninter / gs);
-            const float* iv = inter + (long long)e * ninter;
-            extern __shared__ float sh[];
-            float d = blk_reduce(row_dot(dqw+qb, dsc+sb, dze+sb, o, iv, ninter, gs, tid, nt), sh, tid, nt);
-            if (tid == 0) atomicAdd(&out[o], w * d);
+            int tile = blockIdx.x * rpb;
+            for (int o = tile + wid; o < tile + rpb && o < hidden; o += nw) {
+                float d = wrd(dqw+qb, dsc+sb, dze+sb, o, is, ninter, gs, lane);
+                if (lane == 0) atomicAdd(&out[o], w * d);
+            }
         }
         """
         _FUSEDW = (cp.RawKernel(src, "moew_gate_up"), cp.RawKernel(src, "moew_down"))
     return _FUSEDW
 
 
+# vectorized INT4 loads require in_f % (32*8) == 0 (holds for hidden=2048,
+# inter=768). rpb/threads tuned for occupancy at Qwen3-30B shapes (5090).
+_MOE_RPB, _MOE_THREADS = 8, 256
+
+
 def fused_moe_weighted(x, stacked, rw, E, hidden, inter, out=None, inter_buf=None,
-                       threads=128):
+                       threads=_MOE_THREADS, rpb=_MOE_RPB):
     """Capturable selective MoE FFN driven by an (E,) routing-weight vector.
-    inter_buf must be (E, inter). Only rw[e]>0 experts contribute."""
+    inter_buf must be (E, inter). Only rw[e]>0 experts contribute. x is staged in
+    shared memory per block, so hidden and inter must fit (both are small)."""
     import cupy as cp
     gu, dn = _fusedw_kernels(cp)
     gs = stacked["group"]
@@ -227,13 +272,15 @@ def fused_moe_weighted(x, stacked, rw, E, hidden, inter, out=None, inter_buf=Non
     y = out if out is not None else cp.zeros((hidden,), dtype=cp.float32)
     if out is not None:
         y.fill(0)
-    gu((inter, E), (threads,),
+    gu(((inter + rpb - 1) // rpb, E), (threads,),
        (x, rw, stacked["gate.qweight"], stacked["gate.scales"], stacked["gate.zeros"],
         stacked["up.qweight"], stacked["up.scales"], stacked["up.zeros"],
-        ibuf, np.int32(hidden), np.int32(inter), np.int32(gs)), shared_mem=threads * 4)
-    dn((hidden, E), (threads,),
+        ibuf, np.int32(hidden), np.int32(inter), np.int32(gs), np.int32(rpb)),
+       shared_mem=hidden * 4)
+    dn(((hidden + rpb - 1) // rpb, E), (threads,),
        (ibuf, rw, stacked["down.qweight"], stacked["down.scales"], stacked["down.zeros"],
-        y, np.int32(hidden), np.int32(inter), np.int32(gs)), shared_mem=threads * 4)
+        y, np.int32(hidden), np.int32(inter), np.int32(gs), np.int32(rpb)),
+       shared_mem=inter * 4)
     return y
 
 

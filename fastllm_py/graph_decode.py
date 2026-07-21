@@ -133,6 +133,58 @@ def route_gpu(logits, top_k, scoring="softmax", bias=None, n_group=0,
     return (w * scale).astype(cp.float32)
 
 
+_DENSE_GEMV: dict = {}
+
+
+def _dense_gemv_kernel(cp, ctype: str):
+    """Dense row-major INT4 GEMV for M=1 decode: x staged in shared once, one
+    warp per output row with a shuffle reduction, vectorized 4-byte INT4 loads.
+    The M=1-efficient replacement for Marlin (a GEMM kernel) on the attention
+    projections. ctype = fp16/fp32 for x and y; fp32 accumulation."""
+    if ctype not in _DENSE_GEMV:
+        src = r"""
+        #include <cuda_fp16.h>
+        __device__ __forceinline__ float wrd(
+                const unsigned char* qw, const __half* sc, const __half* ze,
+                int row, const float* vec, int in_f, int gs, int lane) {
+            const unsigned char* wr = qw + (long long)row * (in_f / 2);
+            const __half* s = sc + (long long)row * (in_f / gs);
+            const __half* z = ze + (long long)row * (in_f / gs);
+            float acc = 0.0f;
+            for (int p = lane * 8; p < in_f; p += 256) {
+                int gi = p / gs; float sv = __half2float(s[gi]), zv = __half2float(z[gi]);
+                unsigned int pk = *reinterpret_cast<const unsigned int*>(wr + (p >> 1));
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    unsigned char b = (pk >> (j * 8)) & 0xFF;
+                    acc += ((float)(b & 0xF) - zv) * sv * vec[p + 2 * j];
+                    acc += ((float)(b >> 4) - zv) * sv * vec[p + 2 * j + 1];
+                }
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+            return acc;
+        }
+        extern "C" __global__ void dgemv(
+                const CT* __restrict__ x, const unsigned char* __restrict__ qw,
+                const __half* __restrict__ sc, const __half* __restrict__ ze,
+                CT* __restrict__ y, int in_f, int out_f, int gs, int rpb) {
+            extern __shared__ float xs[];
+            for (int i = threadIdx.x; i < in_f; i += blockDim.x)
+                xs[i] = static_cast<float>(x[i]);
+            __syncthreads();
+            int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, nw = blockDim.x >> 5;
+            int tile = blockIdx.x * rpb;
+            for (int r = tile + wid; r < tile + rpb && r < out_f; r += nw) {
+                float v = wrd(qw, sc, ze, r, xs, in_f, gs, lane);
+                if (lane == 0) y[r] = (CT)v;
+            }
+        }
+        """.replace("CT", ctype)
+        _DENSE_GEMV[ctype] = cp.RawKernel(src, "dgemv")
+    return _DENSE_GEMV[ctype]
+
+
 def graph_capable(model) -> bool:
     """True if GraphDecoder supports this model: INT4 (Marlin dict) linears,
     non-MLA. MoE is supported on a single GPU when experts are INT4-resident
@@ -319,6 +371,45 @@ class GraphDecoder:
         self.graph_fellback = False
         if cfg.is_moe:
             self._prepare_moe()
+        self._prepare_dense_linears()
+
+    def _prepare_dense_linears(self):
+        """Re-quantize the attention projections (q/k/v/o) to row-major INT4 and
+        stash them per layer as `layer._rmw`, so the capturable decode path can
+        use the lean warp-per-row GEMV instead of Marlin. Marlin is a GEMM kernel
+        tiled for M>=16; at decode M=1 it runs at ~1/3 the row-major GEMV's speed
+        (nsys: q/k/v/o projections were 27% of the token). Falls back silently to
+        Marlin for any layer whose fp16 weights can't be re-read."""
+        cp = self.cp
+        import os
+        from .kernels.moe_int4 import quantize_int4_rowmajor
+
+        store = getattr(self.model, "store", None)
+        if store is None or os.environ.get("FASTLLM_DGEMV") != "1":  # opt-in: correct in isolation, but a layer>0 weight-corruption bug remains on MoE models
+            return
+        prefix = "model." if "model.layers.0.self_attn.q_proj.weight" in store else ""
+        names = ("self_attn.q_proj", "self_attn.k_proj",
+                 "self_attn.v_proj", "self_attn.o_proj")
+        for seg in self.segments:
+            with cp.cuda.Device(seg.dev_id):
+                for layer in seg.layers:
+                    rmw = {}
+                    try:
+                        for n in names:
+                            key = f"{prefix}layers.{layer.idx}.{n}.weight"
+                            w = store.get_f32(key)          # (out, in) host fp32
+                            rmw[n] = quantize_int4_rowmajor(w, 128, xp=cp)
+                    except Exception:
+                        rmw = None                          # keep Marlin for this layer
+                    layer._rmw = rmw
+                # persistent output buffers per projection (NO alloc during graph
+                # capture — one buffer per name, reused across this segment's
+                # layers; k/v need distinct buffers as they're live together).
+                seg._proj_bufs = {}
+                ref = next((l._rmw for l in seg.layers if getattr(l, "_rmw", None)), None)
+                if ref is not None:
+                    for n, p in ref.items():
+                        seg._proj_bufs[n] = cp.empty((p["shape"][0],), dtype=self.dtype)
 
     def _prepare_moe(self):
         """Build per-MoE-layer graph data: fp16 gate weights + row-major INT4
@@ -393,6 +484,23 @@ class GraphDecoder:
         return self._moe_out
 
     # ------------------------------------------------------------ per segment
+    def _dgemv(self, seg, inp, payload, buf):
+        """Dense row-major INT4 GEMV (warp-per-row, x staged in shared, shuffle
+        reduce) — the M=1-efficient replacement for Marlin on the projections.
+        inp: (1, in) self.dtype. Writes into the persistent `buf` (no alloc
+        during capture) and returns it as (1, out)."""
+        cp = self.cp
+        k = _dense_gemv_kernel(cp, "__half" if self.dtype == cp.float16 else "float")
+        out_f, in_f = payload["shape"]
+        gs = payload["group"]
+        x = inp.reshape(-1)
+        rpb = 8
+        k(((out_f + rpb - 1) // rpb,), (256,),
+          (x, payload["qweight"], payload["scales"], payload["zeros"], buf,
+           np.int32(in_f), np.int32(out_f), np.int32(gs), np.int32(rpb)),
+          shared_mem=in_f * 4)
+        return buf.reshape(1, out_f)
+
     def _mm(self, seg, inp, w):
         """Marlin INT4 GEMV on the segment's stream with a per-call-site
         workspace (a shared workspace corrupts a replayed graph)."""
@@ -427,7 +535,11 @@ class GraphDecoder:
         seg.ws_i = 0
 
         def lin(layer, name, inp):
-            out = self._mm(seg, inp, layer.w[f"{name}.weight"])
+            rmw = getattr(layer, "_rmw", None)
+            if rmw is not None and name in rmw:      # row-major GEMV (M=1 fast)
+                out = self._dgemv(seg, inp, rmw[name], seg._proj_bufs[name])
+            else:
+                out = self._mm(seg, inp, layer.w[f"{name}.weight"])
             if layer.has(f"{name}.bias"):
                 out = out + layer.w[f"{name}.bias"]
             return out

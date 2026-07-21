@@ -177,7 +177,7 @@ def _dense_gemv_kernel(cp, ctype: str):
         #include <cuda_fp16.h>
         __device__ __forceinline__ float wrd(
                 const unsigned char* qw, const __half* sc, const __half* ze,
-                int row, const float* vec, int in_f, int gs, int lane) {
+                int row, const CT* vec, int in_f, int gs, int lane) {
             const unsigned char* wr = qw + (long long)row * (in_f / 2);
             const __half* s = sc + (long long)row * (in_f / gs);
             const __half* z = ze + (long long)row * (in_f / gs);
@@ -188,8 +188,8 @@ def _dense_gemv_kernel(cp, ctype: str):
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     unsigned char b = (pk >> (j * 8)) & 0xFF;
-                    acc += ((float)(b & 0xF) - zv) * sv * vec[p + 2 * j];
-                    acc += ((float)(b >> 4) - zv) * sv * vec[p + 2 * j + 1];
+                    acc += ((float)(b & 0xF) - zv) * sv * (float)vec[p + 2 * j];
+                    acc += ((float)(b >> 4) - zv) * sv * (float)vec[p + 2 * j + 1];
                 }
             }
             #pragma unroll
@@ -200,9 +200,9 @@ def _dense_gemv_kernel(cp, ctype: str):
                 const CT* __restrict__ x, const unsigned char* __restrict__ qw,
                 const __half* __restrict__ sc, const __half* __restrict__ ze,
                 CT* __restrict__ y, int in_f, int out_f, int gs, int rpb) {
-            extern __shared__ float xs[];
-            for (int i = threadIdx.x; i < in_f; i += blockDim.x)
-                xs[i] = static_cast<float>(x[i]);
+            extern __shared__ CT xs[];   // stage x in activation dtype: half the
+            for (int i = threadIdx.x; i < in_f; i += blockDim.x)  // smem of fp32
+                xs[i] = x[i];            // -> more blocks/SM (occupancy win)
             __syncthreads();
             int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, nw = blockDim.x >> 5;
             int tile = blockIdx.x * rpb;
@@ -691,11 +691,13 @@ class GraphDecoder:
         out_f, in_f = payload["shape"]
         gs = payload["group"]
         x = self._act_in(inp).reshape(-1)
-        rpb = 8
-        k(((out_f + rpb - 1) // rpb,), (256,),
+        # rpb=16/th=512 + fp16-staged x won a graph-timed sweep (1.1-1.2x over
+        # rpb8/th256/fp32-shared) — the smaller smem lifts blocks/SM.
+        rpb = 16
+        k(((out_f + rpb - 1) // rpb,), (512,),
           (x, payload["qweight"], payload["scales"], payload["zeros"], buf,
            np.int32(in_f), np.int32(out_f), np.int32(gs), np.int32(rpb)),
-          shared_mem=in_f * 4)
+          shared_mem=in_f * x.dtype.itemsize)
         return buf.reshape(1, out_f)
 
     def _mm(self, seg, inp, w):

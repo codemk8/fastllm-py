@@ -475,16 +475,68 @@ class GraphDecoder:
             self._moe_srw = cp.ones((1,), dtype=cp.float32)
             self._moe_sout = cp.empty((cfg.hidden_dim,), dtype=cp.float32)
             self._moe_sibuf = cp.empty((1, max(sinter, 1)), dtype=cp.float32)
+            # Startup cache for the row-major stacked experts: building them
+            # re-reads + re-quantizes every expert (minutes for a 30B). Cache the
+            # finished int4 payloads per layer; warm starts stream them straight
+            # from disk to GPU. (Cache is written by the same first run that
+            # builds the marlin expert cache, so the fp16 experts are only ever
+            # read once.)
+            from pathlib import Path
+
+            store = getattr(self.model, "store", None)
+            rdir = (Path(store.model_path) / ".rowmajor_cache") if store else None
+
+            def _save_stacked(path, st):
+                out = {}
+                for k, v in st.items():
+                    if k == "group":
+                        out[k] = np.int64(v)
+                    elif k.endswith(".shape"):
+                        out[k] = np.asarray(v, dtype=np.int64)
+                    else:
+                        out[k] = cp.asnumpy(v)
+                path.parent.mkdir(exist_ok=True)
+                tmp = path.with_name(path.name + ".tmp.npz")
+                np.savez(tmp, **out)
+                tmp.rename(path)
+
+            def _load_stacked(path):
+                z = np.load(path)
+                st = {}
+                for k in z.files:
+                    if k == "group":
+                        st[k] = int(z[k])
+                    elif k.endswith(".shape"):
+                        st[k] = tuple(int(x) for x in z[k])
+                    else:
+                        st[k] = cp.asarray(z[k])
+                return st
+
             for layer in self.model.layers:
                 ml = getattr(layer, "moe", None)
                 if ml is None:
                     continue
-                ews = [ml._materialize_cpu(e) for e in range(E)]
+                rc = (rdir / f"experts.L{layer.idx}.npz") if rdir else None
+                sc = (rdir / f"shared.L{layer.idx}.npz") if rdir else None
+                if rc is not None and rc.exists():
+                    stacked = _load_stacked(rc)
+                    shared = (_load_stacked(sc)
+                              if ml.shared is not None and sc.exists() else
+                              (moe_int4.build_stacked_experts([ml.shared], 128, xp=cp)
+                               if ml.shared is not None else None))
+                else:
+                    ews = [ml._materialize_cpu(e) for e in range(E)]
+                    stacked = moe_int4.build_stacked_experts(ews, 128, xp=cp)
+                    shared = (moe_int4.build_stacked_experts([ml.shared], 128, xp=cp)
+                              if ml.shared is not None else None)
+                    if rc is not None:
+                        _save_stacked(rc, stacked)
+                        if shared is not None:
+                            _save_stacked(sc, shared)
                 layer._gmoe = {
                     "gate_w": ml.gate_weight.astype(cp.float16),
-                    "stacked": moe_int4.build_stacked_experts(ews, 128, xp=cp),
-                    "shared": (moe_int4.build_stacked_experts([ml.shared], 128, xp=cp)
-                               if ml.shared is not None else None),
+                    "stacked": stacked,
+                    "shared": shared,
                     "shared_gate_w": (ml.shared_gate.astype(cp.float16)
                                       if ml.shared_gate is not None else None),
                 }

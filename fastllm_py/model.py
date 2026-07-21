@@ -258,24 +258,53 @@ class Model:
         e_bias = (store.get_f32(base + "mlp.gate.e_score_correction_bias")
                   if base + "mlp.gate.e_score_correction_bias" in store else None)
 
-        experts, placement = {}, {}
+        # Count experts by probing names (cheap __contains__ checks).
         eid = 0
         while base + f"mlp.experts.{eid}.gate_proj.weight" in store:
-            keys = {p: base + f"mlp.experts.{eid}.{p}_proj.weight"
-                    for p in ("gate", "up", "down")}
-            experts[eid] = {
-                p: store.get(k).astype(expert_dtype) for p, k in keys.items()
-            }
             eid += 1
+
+        def _expert_keys(e):
+            return {p: base + f"mlp.experts.{e}.{p}_proj.weight"
+                    for p in ("gate", "up", "down")}
+
+        def _lazy_expert(e):
+            keys = _expert_keys(e)
+            return lambda: {p: store.get(k).astype(expert_dtype)
+                            for p, k in keys.items()}
+
+        # Startup cache: quantizing 128x3 expert matrices/layer dominates load
+        # (~5 min for a 30B MoE) and re-reads the whole bf16 checkpoint. Cache
+        # the finished marlin payloads per layer; on a warm start load those and
+        # keep the fp16 experts LAZY (only materialized if ever CPU-placed), so
+        # neither the bf16 read nor the quantization is repeated.
+        experts, placement = {}, {}
+        ecache = store.model_path / ".expert_cache" / f"marlin.L{layer.idx}.npz"
+        gpu_payloads = None
+        if gpu_expert_quant == "int4" and ecache.exists():
+            z = np.load(ecache)
+            gpu_payloads = {e: {} for e in range(eid)}
+            for key in z.files:
+                e, rest = key.split(".", 1)
+                gpu_payloads[int(e)][rest] = z[key]
+            for e in range(eid):
+                experts[e] = _lazy_expert(e)
+        else:
+            for e in range(eid):
+                experts[e] = {p: store.get(k).astype(expert_dtype)
+                              for p, k in _expert_keys(e).items()}
+            if gpu_expert_quant == "int4":
+                from .moe import build_marlin_expert_payload
+
+                gpu_payloads = {e: build_marlin_expert_payload(experts[e])
+                                for e in range(eid)}
+                ecache.parent.mkdir(exist_ok=True)
+                tmp = ecache.with_name(ecache.name + ".tmp.npz")
+                np.savez(tmp, **{f"{e}.{k}": v
+                                 for e, p in gpu_payloads.items()
+                                 for k, v in p.items()})
+                tmp.rename(ecache)  # atomic-ish: no truncated cache on kill
         for e in range(eid):
             placement[e] = moe_device.expert_device(e, eid)
-
-        gpu_payloads = None
-        if gpu_expert_quant == "int4":
-            from .moe import build_marlin_expert_payload
-
-            gpu_payloads = {e: build_marlin_expert_payload(experts[e])
-                            for e in range(eid)}
 
         shared = shared_gate = None
         for sname in ("mlp.shared_expert.", "mlp.shared_experts."):

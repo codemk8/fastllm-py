@@ -33,10 +33,41 @@ MLA/MoE fall back to eager decode.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from .kernels.ops import apply_rope, rmsnorm, swiglu
 from .model import matmul_w
+
+# --------------------------------------------------------------------------
+# Activation-dtype contract (mixed precision).
+#
+# The residual/activation stream is NOT guaranteed to be a single dtype: some
+# ops accumulate in higher precision (the MoE branch and attention produce fp32)
+# and the residual absorbs that. Every kernel that CONSUMES an activation must
+# therefore coerce its input to the *compute* dtype it was compiled for — do it
+# through GraphDecoder._act_in() (never assume the incoming dtype). Custom
+# RawKernels are compiled per compute-dtype via the ctype string from
+# _act_ctype(); to add a new activation/compute precision (bf16, fp8, ...) add
+# one entry to _ACT_CTYPE and make sure the kernels support it. Set
+# FASTLLM_CHECK_DTYPE=1 to assert, at every kernel boundary, that activations
+# only ever flow in a registered dtype (catches a new op that forgets to cast).
+# --------------------------------------------------------------------------
+_ACT_CTYPE: dict = {"float16": "__half", "float32": "float"}
+_CHECK_DTYPE = os.environ.get("FASTLLM_CHECK_DTYPE") == "1"
+
+
+def _act_ctype(dtype) -> str:
+    """CUDA C scalar type for an activation/compute dtype. Raises (rather than
+    silently mis-reading memory) on an unregistered dtype — the single place to
+    extend for a new precision."""
+    name = np.dtype(dtype).name
+    if name not in _ACT_CTYPE:
+        raise TypeError(
+            f"activation dtype {name!r} has no registered kernel ctype; add it "
+            f"to _ACT_CTYPE (and ensure the kernels compile for it)")
+    return _ACT_CTYPE[name]
 
 
 def apply_penalties(logits, counts, repetition_penalty: float = 1.0,
@@ -349,6 +380,9 @@ class GraphDecoder:
         self.cfg = cfg
         self.max_len = max_len
         self.dtype = cp.float32 if model.dtype == "float32" else cp.float16
+        # compute dtype for custom RawKernels; activations are coerced to it via
+        # _act_in() at every kernel boundary (see the module-level contract).
+        self.ctype = _act_ctype(self.dtype)
 
         # group consecutive layers by device into segments
         self.segments = []
@@ -385,7 +419,7 @@ class GraphDecoder:
         from .kernels.moe_int4 import quantize_int4_rowmajor
 
         store = getattr(self.model, "store", None)
-        if store is None or os.environ.get("FASTLLM_DGEMV") != "1":  # opt-in: correct in isolation, but a layer>0 weight-corruption bug remains on MoE models
+        if store is None or os.environ.get("FASTLLM_NO_DGEMV") == "1":  # default on; escape hatch reverts projections to Marlin
             return
         prefix = "model." if "model.layers.0.self_attn.q_proj.weight" in store else ""
         names = ("self_attn.q_proj", "self_attn.k_proj",
@@ -483,17 +517,30 @@ class GraphDecoder:
                 self._moe_out += self._moe_sout
         return self._moe_out
 
+    # ------------------------------------------------------------ dtype contract
+    def _act_in(self, t):
+        """Coerce an activation to the compute dtype the custom kernels expect.
+        The residual stream may be fp32 (the MoE branch / attention accumulate in
+        fp32), so every kernel that reads an activation MUST route it through
+        here — a kernel compiled for __half would otherwise reinterpret fp32
+        bytes as fp16 pairs and produce NaNs. No-op when already the right dtype.
+        With FASTLLM_CHECK_DTYPE=1, asserts the incoming dtype is registered."""
+        if _CHECK_DTYPE and np.dtype(t.dtype).name not in _ACT_CTYPE:
+            raise TypeError(f"activation dtype {t.dtype} not registered (see "
+                            "_ACT_CTYPE); a new op is emitting an unhandled dtype")
+        return t if t.dtype == self.dtype else t.astype(self.dtype)
+
     # ------------------------------------------------------------ per segment
     def _dgemv(self, seg, inp, payload, buf):
         """Dense row-major INT4 GEMV (warp-per-row, x staged in shared, shuffle
         reduce) — the M=1-efficient replacement for Marlin on the projections.
-        inp: (1, in) self.dtype. Writes into the persistent `buf` (no alloc
-        during capture) and returns it as (1, out)."""
+        inp: (1, in) any registered activation dtype (coerced to self.dtype).
+        Writes into the persistent `buf` (no alloc during capture) -> (1, out)."""
         cp = self.cp
-        k = _dense_gemv_kernel(cp, "__half" if self.dtype == cp.float16 else "float")
+        k = _dense_gemv_kernel(cp, self.ctype)
         out_f, in_f = payload["shape"]
         gs = payload["group"]
-        x = inp.reshape(-1)
+        x = self._act_in(inp).reshape(-1)
         rpb = 8
         k(((out_f + rpb - 1) // rpb,), (256,),
           (x, payload["qweight"], payload["scales"], payload["zeros"], buf,
@@ -524,7 +571,7 @@ class GraphDecoder:
         H, KVH, D = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
         assert (D & (D - 1)) == 0, "flash-decode kernel needs power-of-two head_dim"
         scale = D ** -0.5
-        ctype = "float" if self.dtype == cp.float32 else "__half"
+        ctype = self.ctype
         write = _write_kv_kernel(cp, ctype)
         attn = _attn_decode_kernel(cp, ctype)
         row = KVH * D
@@ -556,8 +603,11 @@ class GraphDecoder:
             k = apply_rope(k, cos, sin)
 
             kc, vc = seg.k_cache[li], seg.v_cache[li]
+            # KV cache + write kernel are compute-dtype; coerce k/v (activations)
+            # through the dtype contract, same as dgemv.
             write((blocks,), (128,),
-                  (kc, vc, cp.ascontiguousarray(k), cp.ascontiguousarray(v),
+                  (kc, vc, cp.ascontiguousarray(self._act_in(k)),
+                   cp.ascontiguousarray(self._act_in(v)),
                    seg.pos_idx, np.int32(row)))
             # flash-decode attention: O(valid_len), not O(max_len)
             qh = cp.ascontiguousarray(q.reshape(H, D).astype(cp.float32))

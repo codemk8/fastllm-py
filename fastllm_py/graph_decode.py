@@ -284,6 +284,47 @@ def _route_topk_kernel(cp):
     return _ROUTE_TOPK
 
 
+_ADD_RMS: dict = {}
+
+
+def _add_rmsnorm_kernel(cp, xt: str, dt: str, wt: str):
+    """Fused residual-add + RMSNorm: xnew = x + delta (stored, fp32), then
+    h = rmsnorm(xnew)*w. Every residual add in the decoder is immediately
+    followed by an rmsnorm, so this folds the standalone elementwise add (96
+    launches/token) into the norm. One block per row; fp32 math. xnew is emitted
+    fp32 (the residual stream stays full precision, as the MoE branch already
+    made it); h is emitted __half for the next projection."""
+    key = (xt, dt, wt)
+    if key not in _ADD_RMS:
+        src = f"""
+        #include <cuda_fp16.h>
+        extern "C" __global__ void add_rmsnorm(
+                const {xt}* __restrict__ x, const {dt}* __restrict__ delta,
+                const {wt}* __restrict__ w, float* __restrict__ xnew,
+                __half* __restrict__ h, int dim, float eps) {{
+            int row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+            const {xt}* xr = x + (long long)row * dim;
+            const {dt}* dr = delta + (long long)row * dim;
+            float* xo = xnew + (long long)row * dim;
+            __half* ho = h + (long long)row * dim;
+            extern __shared__ float sh[];
+            float acc = 0.0f;
+            for (int i = tid; i < dim; i += nt) {{
+                float v = static_cast<float>(xr[i]) + static_cast<float>(dr[i]);
+                xo[i] = v; acc += v * v;
+            }}
+            sh[tid] = acc; __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) {{
+                if (tid < s) sh[tid] += sh[tid + s]; __syncthreads();
+            }}
+            float inv = rsqrtf(sh[0] / dim + eps);
+            for (int i = tid; i < dim; i += nt)
+                ho[i] = (__half)(xo[i] * inv * static_cast<float>(w[i]));
+        }}"""
+        _ADD_RMS[key] = cp.RawKernel(src, "add_rmsnorm")
+    return _ADD_RMS[key]
+
+
 _ROPE_K: dict = {}
 
 
@@ -667,6 +708,25 @@ class GraphDecoder:
                             "_ACT_CTYPE); a new op is emitting an unhandled dtype")
         return t if t.dtype == self.dtype else t.astype(self.dtype)
 
+    def _add_rmsnorm(self, x, delta, weight, eps):
+        """Fused (x + delta) then RMSNorm. Returns (xnew fp32 residual, h fp16
+        norm output). Replaces a cupy add + a separate rmsnorm launch."""
+        cp = self.cp
+        dim = x.shape[-1]
+        xf = x.reshape(-1, dim)
+        df = delta.reshape(-1, dim)
+        rows = xf.shape[0]
+
+        def _t(a):
+            return "float" if a.dtype == cp.float32 else "__half"
+        ker = _add_rmsnorm_kernel(cp, _t(xf), _t(df), _t(weight))
+        xnew = cp.empty((rows, dim), dtype=cp.float32)
+        h = cp.empty((rows, dim), dtype=cp.float16)
+        th = 256 if dim >= 256 else 128
+        ker((rows,), (th,), (xf, df, weight, xnew, h, np.int32(dim),
+                             np.float32(eps)), shared_mem=th * 4)
+        return xnew.reshape(x.shape), h.reshape(x.shape)
+
     def _rope(self, x, cos, sin, nheads):
         """Fused RoPE over x (…, nheads, D). cos/sin are (1, D/2) fp32 (the
         precomputed table row for this position). Returns a new array."""
@@ -743,8 +803,17 @@ class GraphDecoder:
                 out = out + layer.w[f"{name}.bias"]
             return out
 
+        # `pending` is the previous layer's MoE/MLP residual delta, deferred so
+        # its add fuses into THIS layer's input-norm (add_rmsnorm). Every
+        # residual add in the block is thus folded into the following rmsnorm.
+        pending = None
         for li, layer in enumerate(seg.layers):
-            h = rmsnorm(x, layer.w["input_layernorm.weight"], cfg.norm_eps)
+            if pending is None:
+                h = rmsnorm(x, layer.w["input_layernorm.weight"], cfg.norm_eps)
+            else:
+                x, h = self._add_rmsnorm(x, pending,
+                                         layer.w["input_layernorm.weight"],
+                                         cfg.norm_eps)
             q = lin(layer, "self_attn.q_proj", h).reshape(1, H, D)
             k = lin(layer, "self_attn.k_proj", h).reshape(1, KVH, D)
             v = lin(layer, "self_attn.v_proj", h).reshape(1, KVH, D)
@@ -776,19 +845,28 @@ class GraphDecoder:
                                   np.float32(scale)),
                  shared_mem=(D + self.max_len + _ABLK) * 4)
             ctx = ctx.reshape(1, H * D)
-            x = x + lin(layer, "self_attn.o_proj", ctx)
-
-            h = rmsnorm(x, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)
+            o = lin(layer, "self_attn.o_proj", ctx)
+            x, h = self._add_rmsnorm(
+                x, o, layer.w["post_attention_layernorm.weight"], cfg.norm_eps)
             if getattr(layer, "_gmoe", None) is not None:
-                x = x + self._moe_branch(layer, h)[None]
+                pending = self._moe_branch(layer, h)[None]
             else:
                 g = self._mm(seg, h, layer.w["mlp.gate_proj.weight"])
                 u = self._mm(seg, h, layer.w["mlp.up_proj.weight"])
-                x = x + self._mm(seg, swiglu(g, u), layer.w["mlp.down_proj.weight"])
+                pending = self._mm(seg, swiglu(g, u),
+                                   layer.w["mlp.down_proj.weight"])
 
+        # flush the last layer's deferred residual
         if seg.is_last:  # final norm here; lm_head runs outside the graph
-            seg.hidden_out[:] = rmsnorm(x, self.model.final_norm, cfg.norm_eps)[0]
+            if pending is not None:
+                _, hn = self._add_rmsnorm(x, pending, self.model.final_norm,
+                                          cfg.norm_eps)
+                seg.hidden_out[:] = hn[0]
+            else:
+                seg.hidden_out[:] = rmsnorm(x, self.model.final_norm, cfg.norm_eps)[0]
         else:
+            if pending is not None:
+                x = x + pending
             seg.hidden_out[:] = x[0]
 
     # ------------------------------------------------------------- prefill

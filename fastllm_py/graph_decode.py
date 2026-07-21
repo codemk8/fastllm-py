@@ -240,12 +240,17 @@ _ATTN_DECODE: dict = {}
 
 
 def _attn_decode_kernel(cp, ctype: str):
-    """Flash-decode attention RawKernel: one block per query head, D threads.
-    Loops only over VALID keys [0, pos] (read from the device pos buffer), so
-    its cost is O(valid_len) regardless of the KV buffer size — unlike the
-    reduction path which scans the whole max_len buffer every token. GQA-aware
-    (kv_head = h / (H/KVH)), online softmax, fp32 accumulation. Capturable.
-    Requires head_dim D to be a power of two (holds for 64/128)."""
+    """Flash-decode attention RawKernel: one block per query head (GQA-aware,
+    kv_head = h/(H/KVH)), online softmax in fp32. Cost is O(valid_len) (loops
+    only over VALID keys [0, pos] from the device pos buffer).
+
+    Two-phase, no per-key block reduction (the old kernel did a D-way shared
+    reduction *per key* — ~7 __syncthreads/key — and ran at ~3% of BW; ~4x
+    faster here): (1) each thread scores a subset of keys (full D dot-product),
+    (2) block softmax over the VALID keys, (3) each thread accumulates one output
+    dim over all keys. `scores` is staged in shared, so shared_mem must hold
+    max_len floats — fine to ~8-12K context; longer needs a split-KV variant.
+    q/out are fp32; kc/vc are `ctype`. Block is `threads` (>= D), not tied to D."""
     key = ctype
     if key not in _ATTN_DECODE:
         _ATTN_DECODE[key] = cp.RawKernel(rf"""
@@ -257,38 +262,39 @@ def _attn_decode_kernel(cp, ctype: str):
                 float* __restrict__ out,           // (H, D) fp32
                 const int* __restrict__ pos,       // device scalar; valid = pos[0]+1
                 int H, int KVH, int D, float scale) {{
-            int h = blockIdx.x;
-            int d = threadIdx.x;                   // 0..D-1
-            int rep = H / KVH;
-            int kvh = h / rep;
+            int h = blockIdx.x, tid = threadIdx.x, BLK = blockDim.x;
+            int rep = H / KVH, kvh = h / rep, VL = pos[0] + 1;
             extern __shared__ float sh[];
             float* sq = sh;                        // D
-            float* red = sh + D;                   // D
-            __shared__ float m, l, s_score;
-            sq[d] = q[h * D + d];
-            if (d == 0) {{ m = -1e30f; l = 0.0f; }}
-            float acc = 0.0f;
+            float* scores = sh + D;                // VL (<= max_len)
+            float* red = scores + VL;              // BLK
+            for (int i = tid; i < D; i += BLK) sq[i] = q[h * D + i];
             __syncthreads();
-            int VL = pos[0] + 1;
-            for (int j = 0; j < VL; j++) {{
+            // (1) scores[j] = dot(q, k_j) * scale
+            for (int j = tid; j < VL; j += BLK) {{
                 long long base = ((long long)j * KVH + kvh) * D;
-                red[d] = sq[d] * (float)kc[base + d];
-                __syncthreads();
-                for (int s = D >> 1; s > 0; s >>= 1) {{
-                    if (d < s) red[d] += red[d + s];
-                    __syncthreads();
-                }}
-                if (d == 0) s_score = red[0] * scale;
-                __syncthreads();
-                float sc = s_score;
-                float new_m = fmaxf(m, sc);
-                float corr = __expf(m - new_m);
-                float p = __expf(sc - new_m);
-                acc = acc * corr + p * (float)vc[base + d];
-                if (d == 0) {{ l = l * corr + p; m = new_m; }}
-                __syncthreads();
+                float acc = 0.0f;
+                for (int d = 0; d < D; d++) acc += sq[d] * (float)kc[base + d];
+                scores[j] = acc * scale;
             }}
-            out[h * D + d] = acc / l;
+            __syncthreads();
+            // (2) softmax over VALID keys: block max, then exp + block sum
+            float mx = -1e30f;
+            for (int j = tid; j < VL; j += BLK) mx = fmaxf(mx, scores[j]);
+            red[tid] = mx; __syncthreads();
+            for (int s = BLK >> 1; s > 0; s >>= 1) {{ if (tid < s) red[tid] = fmaxf(red[tid], red[tid+s]); __syncthreads(); }}
+            float m = red[0]; __syncthreads();
+            float sm = 0.0f;
+            for (int j = tid; j < VL; j += BLK) {{ float e = __expf(scores[j] - m); scores[j] = e; sm += e; }}
+            red[tid] = sm; __syncthreads();
+            for (int s = BLK >> 1; s > 0; s >>= 1) {{ if (tid < s) red[tid] += red[tid+s]; __syncthreads(); }}
+            float l = red[0]; __syncthreads();
+            // (3) out[d] = sum_j p_j * v_j[d] / l  (one dim per thread)
+            for (int d = tid; d < D; d += BLK) {{
+                float acc = 0.0f;
+                for (int j = 0; j < VL; j++) acc += scores[j] * (float)vc[((long long)j * KVH + kvh) * D + d];
+                out[h * D + d] = acc / l;
+            }}
         }}""", f"attn_decode_{ctype.replace(' ', '_')}")
     return _ATTN_DECODE[key]
 
@@ -609,13 +615,17 @@ class GraphDecoder:
                   (kc, vc, cp.ascontiguousarray(self._act_in(k)),
                    cp.ascontiguousarray(self._act_in(v)),
                    seg.pos_idx, np.int32(row)))
-            # flash-decode attention: O(valid_len), not O(max_len)
+            # flash-decode attention: O(valid_len), not O(max_len). Two-phase
+            # kernel — one block per head, `_ABLK` threads; shared holds the
+            # query (D), the per-key scores (up to max_len), and a reduction
+            # scratch (_ABLK).
             qh = cp.ascontiguousarray(q.reshape(H, D).astype(cp.float32))
             ctx = cp.empty((H, D), dtype=cp.float32)
-            attn((H,), (D,), (qh, kc, vc, ctx, seg.pos_idx,
-                              np.int32(H), np.int32(KVH), np.int32(D),
-                              np.float32(scale)),
-                 shared_mem=2 * D * 4)
+            _ABLK = 128
+            attn((H,), (_ABLK,), (qh, kc, vc, ctx, seg.pos_idx,
+                                  np.int32(H), np.int32(KVH), np.int32(D),
+                                  np.float32(scale)),
+                 shared_mem=(D + self.max_len + _ABLK) * 4)
             ctx = ctx.reshape(1, H * D).astype(self.dtype)
             x = x + lin(layer, "self_attn.o_proj", ctx)
 
